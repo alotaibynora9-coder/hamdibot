@@ -1,34 +1,36 @@
 import os
 import asyncio
+import glob
 from threading import Thread
 from flask import Flask
 from PIL import Image
 from nudenet import NudeDetector
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.types import Channel, Chat
 
-# البيانات الخاصة بالبوت في السيرفر الجديد
 API_ID = 7226664693
 API_HASH = '4e7a8aee718c1e8e63956fec3339d01d'
 BOT_TOKEN = '8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOhC5qSA4k'
 
-# --- سيرفر Flask لمنع إغلاق الخدمة من الاستضافة ---
+SESSIONS_DIR = "sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+# --- سيرفر Flask للحفاظ على عمل البوت في الاستضافات ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "Bot2 Cleaner Service is Online!"
+    return "Cleaner Bot Manager is Active!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host='0.0.0.0', port=port)
 
-# تشغيل الـ Web Server في الخلفية
 Thread(target=run_flask, daemon=True).start()
 
-# --- قائمة الكلمات والتصنيفات ---
+# --- قوائم الفحص ---
 EXPLICIT_KEYWORDS = [
     "سكس", "جنس", "اباحي", "إباحي", "شرموط", "قحبة", "دعارة", "فضايح", "فضيحة",
     "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس",
@@ -46,8 +48,13 @@ EXPLICIT_LABELS = [
 detector = NudeDetector()
 user_states = {}
 
-# إنشاء كائن البوت مع جلسة مستقلة
-bot = TelegramClient('standalone_cleaner_bot', API_ID, API_HASH)
+bot = TelegramClient('cleaner_manager_bot', API_ID, API_HASH)
+
+# --- أزرار اللوحة الثابتة ---
+MAIN_KEYBOARD = [
+    [Button.text("➕ إضافة حساب", resize=True), Button.text("👥 الحسابات", resize=True)],
+    [Button.text("▶️ تشغيل الفحص", resize=True)]
+]
 
 def is_explicit_text(text):
     if not text:
@@ -65,89 +72,178 @@ def is_explicit_image(image_path):
         pass
     return False
 
-async def inspect_and_clean(user_client, status_msg):
+# --- فحص وتنظيف حساب محدد ---
+async def clean_account(session_file, status_msg):
+    phone = os.path.basename(session_file).replace('.session', '')
+    with open(session_file, 'r', encoding='utf-8') as f:
+        session_str = f.read().strip()
+
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await status_msg.respond(f"❌ الجلسة للحساب `{phone}` غير صالحة أو تم تسجيل الخروج منها.")
+            return 0
+    except Exception as e:
+        await status_msg.respond(f"⚠️ تعذر الاتصال بالحساب `{phone}`: {e}")
+        return 0
+
     left_count = 0
     temp_dir = "temp_media_cleaner"
     os.makedirs(temp_dir, exist_ok=True)
 
-    async for dialog in user_client.iter_dialogs():
-        entity = dialog.entity
-        if not isinstance(entity, (Channel, Chat)):
-            continue
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            if not isinstance(entity, (Channel, Chat)):
+                continue
 
-        title = dialog.name or ""
-        is_explicit = False
+            title = dialog.name or ""
+            is_explicit = False
 
-        if is_explicit_text(title):
-            is_explicit = True
+            if is_explicit_text(title):
+                is_explicit = True
 
-        if not is_explicit:
-            try:
-                photo_path = await user_client.download_profile_photo(entity, file=os.path.join(temp_dir, "profile.jpg"))
-                if photo_path and is_explicit_image(photo_path):
-                    is_explicit = True
-                if photo_path and os.path.exists(photo_path):
-                    os.remove(photo_path)
-            except Exception:
-                pass
-
-        if not is_explicit:
-            try:
-                async for message in user_client.iter_messages(entity, limit=15):
-                    msg_text = message.text or message.caption or ""
-                    if is_explicit_text(msg_text):
+            if not is_explicit:
+                try:
+                    photo_path = await client.download_profile_photo(entity, file=os.path.join(temp_dir, f"{phone}_prof.jpg"))
+                    if photo_path and is_explicit_image(photo_path):
                         is_explicit = True
-                        break
+                    if photo_path and os.path.exists(photo_path):
+                        os.remove(photo_path)
+                except Exception:
+                    pass
 
-                    if message.photo:
-                        try:
-                            media_path = await message.download_media(file=os.path.join(temp_dir, "msg_media.jpg"))
-                            if media_path and is_explicit_image(media_path):
-                                is_explicit = True
-                                if os.path.exists(media_path):
+            if not is_explicit:
+                try:
+                    async for message in client.iter_messages(entity, limit=10):
+                        msg_text = message.text or message.caption or ""
+                        if is_explicit_text(msg_text):
+                            is_explicit = True
+                            break
+
+                        if message.photo:
+                            try:
+                                media_path = await message.download_media(file=os.path.join(temp_dir, f"{phone}_msg.jpg"))
+                                if media_path and is_explicit_image(media_path):
+                                    is_explicit = True
+                                    if os.path.exists(media_path):
+                                        os.remove(media_path)
+                                    break
+                                if media_path and os.path.exists(media_path):
                                     os.remove(media_path)
-                                break
-                            if media_path and os.path.exists(media_path):
-                                os.remove(media_path)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
-        if is_explicit:
-            try:
-                await user_client(LeaveChannelRequest(entity))
-                left_count += 1
-                await status_msg.edit(f"⏳ جاري الفحص...\nتم اكتشاف ومغادرة: **{title}**\nإجمالي المغادرات حتى الآن: {left_count}")
-                await asyncio.sleep(2)
-            except Exception:
-                pass
+            if is_explicit:
+                try:
+                    await client(LeaveChannelRequest(entity))
+                    left_count += 1
+                    await status_msg.edit(f"⏳ جاري فحص الحساب `{phone}`...\nتم اكتشاف ومغادرة: **{title}**\nإجمالي المغادرات للحساب: {left_count}")
+                    await asyncio.sleep(2)
+                except Exception:
+                    pass
+    finally:
+        await client.disconnect()
 
     return left_count
 
-# --- معالجة أمر /start ---
+# --- معالجة الأوامر والرسائل ---
+
 @bot.on(events.NewMessage(pattern=r'^/start'))
 async def start_handler(event):
+    user_states[event.chat_id] = None
     await event.respond(
-        "أهلاً بك في بوت تنظيف الحسابات! 🧹\n\n"
-        "لتبدأ فحص حسابك، أرسل رقم الهاتف مع مفتاح الدولة (مثال: `+966500000000`)"
+        "أهلاً بك في بوت إدارة وتنظيف الحسابات! 🧹\n"
+        "اختر خياراً من الأزرار الثابتة بالأسفل للبدء.",
+        buttons=MAIN_KEYBOARD
     )
 
-# --- معالجة الرسائل العادية للتعامل مع تسجيل الدخول ---
 @bot.on(events.NewMessage)
-async def message_handler(event):
-    if event.text.startswith('/'):
-        return
-
+async def main_handler(event):
     chat_id = event.chat_id
     text = event.text.strip()
 
-    # مرحلة كود التحقق
-    if chat_id in user_states and user_states[chat_id].get('step') == 'await_code':
-        data = user_states[chat_id]
-        client = data['client']
-        phone = data['phone']
-        phone_code_hash = data['phone_code_hash']
+    if text.startswith('/'):
+        return
+
+    # 1. زر إضافة حساب
+    if text == "➕ إضافة حساب":
+        user_states[chat_id] = {'step': 'await_phone'}
+        await event.respond("يرجى إرسال رقم الهاتف مع رمز الدولة (مثال: `+966500000000`):")
+        return
+
+    # 2. زر عرض الحسابات
+    elif text == "👥 الحسابات":
+        sessions = glob.glob(f"{SESSIONS_DIR}/*.session")
+        if not sessions:
+            await event.respond("لا يوجد أي حسابات محفوظة حالياً.")
+            return
+
+        msg = "📱 **قائمة الحسابات المحفوظة:**\n\n"
+        buttons = []
+        for s in sessions:
+            phone = os.path.basename(s).replace('.session', '')
+            msg += f"• `{phone}`\n"
+            buttons.append([Button.inline(f"🗑 حذف {phone}", data=f"del_{phone}")])
+
+        await event.respond(msg, buttons=buttons)
+        return
+
+    # 3. زر تشغيل الفحص
+    elif text == "▶️ تشغيل الفحص":
+        sessions = glob.glob(f"{SESSIONS_DIR}/*.session")
+        if not sessions:
+            await event.respond("⚠️ لا يوجد حسابات مضافة للبدء في فحصها! قم بإضافة حساب أولاً.")
+            return
+
+        status_msg = await event.respond("🚀 جاري بدء عملية الفحص لجميع الحسابات...")
+        total_cleaned = 0
+
+        for session_file in sessions:
+            phone = os.path.basename(session_file).replace('.session', '')
+            await status_msg.edit(f"🔍 جاري البدء بفحص الحساب: `{phone}`...")
+            count = await clean_account(session_file, status_msg)
+            total_cleaned += count
+
+        await status_msg.edit(f"✅ اكتملت عملية الفحص بنجاح لكافة الحسابات!\nإجمالي القنوات والمجموعات المخالفة التي تم الخروج منها: **{total_cleaned}**")
+        return
+
+    # --- مراحل إضافة الحساب ---
+    state = user_states.get(chat_id, {})
+    
+    # استقبال الرقم
+    if state and state.get('step') == 'await_phone':
+        if not (text.startswith('+') and text[1:].isdigit()):
+            await event.respond("⚠️ يرجى إرسال رقم هاتف صحيح يبدأ بـ +")
+            return
+
+        status_msg = await event.respond("جاري إرسال كود التحقق...")
+        temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await temp_client.connect()
+
+        try:
+            res = await temp_client.send_code_request(text)
+            user_states[chat_id] = {
+                'step': 'await_code',
+                'client': temp_client,
+                'phone': text,
+                'phone_code_hash': res.phone_code_hash
+            }
+            await status_msg.edit("تم إرسال كود التحقق عبر التلجرام. يرجى إرسال الكود هنا:")
+        except Exception as e:
+            await status_msg.edit(f"❌ تعذر إرسال الكود: {e}")
+            await temp_client.disconnect()
+            user_states[chat_id] = None
+        return
+
+    # استقبال الكود
+    elif state and state.get('step') == 'await_code':
+        client = state['client']
+        phone = state['phone']
+        phone_code_hash = state['phone_code_hash']
 
         status_msg = await event.respond("جاري التحقق من الكود...")
         try:
@@ -158,56 +254,58 @@ async def message_handler(event):
                 await status_msg.edit("الحساب محمّي بكلمة سر (التحقق بخطوتين)، يرجى إرسال كلمة السر الآن:")
                 return
             else:
-                await status_msg.edit(f"فشل التسجيل: {e}")
-                del user_states[chat_id]
+                await status_msg.edit(f"❌ فشل التسجيل: {e}")
+                await client.disconnect()
+                user_states[chat_id] = None
                 return
 
-        await status_msg.edit("تم تسجيل الدخول بنجاح! 🚀 جاري بدء فحص القنوات والمجموعات...")
-        count = await inspect_and_clean(client, status_msg)
+        # حفظ الجلسة
+        session_str = client.session.save()
+        session_file = os.path.join(SESSIONS_DIR, f"{phone}.session")
+        with open(session_file, 'w', encoding='utf-8') as f:
+            f.write(session_str)
+
         await client.disconnect()
-        await status_msg.edit(f"✅ اكتمل الفحص بنجاح!\nعدد المجموعات والقنوات الإباحية التي تم الخروج منها: **{count}**")
-        del user_states[chat_id]
+        await status_msg.edit(f"✅ تم حفظ الحساب `{phone}` بنجاح!")
+        user_states[chat_id] = None
         return
 
-    # مرحلة كلمة سر التحقق بخطوتين
-    elif chat_id in user_states and user_states[chat_id].get('step') == 'await_password':
-        data = user_states[chat_id]
-        client = data['client']
-        
+    # استقبال كلمة السر (التحقق بخطوتين)
+    elif state and state.get('step') == 'await_password':
+        client = state['client']
+        phone = state['phone']
+
         status_msg = await event.respond("جاري فحص كلمة السر...")
         try:
             await client.sign_in(password=text)
         except Exception as e:
-            await status_msg.edit(f"كلمة السر خاطئة: {e}")
+            await status_msg.edit(f"❌ كلمة السر خاطئة: {e}")
             return
 
-        await status_msg.edit("تم تسجيل الدخول بنجاح! 🚀 جاري بدء فحص القنوات والمجموعات...")
-        count = await inspect_and_clean(client, status_msg)
+        session_str = client.session.save()
+        session_file = os.path.join(SESSIONS_DIR, f"{phone}.session")
+        with open(session_file, 'w', encoding='utf-8') as f:
+            f.write(session_str)
+
         await client.disconnect()
-        await status_msg.edit(f"✅ اكتمل الفحص بنجاح!\nعدد المجموعات والقنوات الإباحية التي تم الخروج منها: **{count}**")
-        del user_states[chat_id]
+        await status_msg.edit(f"✅ تم حفظ الحساب `{phone}` بنجاح!")
+        user_states[chat_id] = None
         return
 
-    # مرحلة إرسال رقم الهاتف
-    elif text.startswith('+') and text[1:].isdigit():
-        status_msg = await event.respond("جاري إرسال كود التحقق إلى حسابك...")
-        temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await temp_client.connect()
-        
-        try:
-            res = await temp_client.send_code_request(text)
-            user_states[chat_id] = {
-                'step': 'await_code',
-                'client': temp_client,
-                'phone': text,
-                'phone_code_hash': res.phone_code_hash
-            }
-            await status_msg.edit("تم إرسال كود التحقق عبر التلجرام. أرسل الكود هنا:")
-        except Exception as e:
-            await status_msg.edit(f"تعذر إرسال الكود: {e}")
-            await temp_client.disconnect()
+# --- معالجة أزرار حذف الحساب الشفافة ---
+@bot.on(events.CallbackQuery(pattern=r'^del_'))
+async def delete_account_handler(event):
+    phone = event.data.decode('utf-8').replace('del_', '')
+    session_file = os.path.join(SESSIONS_DIR, f"{phone}.session")
+    
+    if os.path.exists(session_file):
+        os.remove(session_file)
+        await event.answer("تم حذف الحساب بنجاح!", alert=True)
+        await event.delete()
+    else:
+        await event.answer("الحساب غير موجود أو تم حذفه مسبقاً.", alert=True)
 
 if __name__ == '__main__':
-    print("السيرفر المستقل يعمل الآن...")
+    print("شغال بوت إدارة وتنظيف الحسابات...")
     bot.start(bot_token=BOT_TOKEN)
     bot.run_until_disconnected()
