@@ -2,3 +2,4 @@ telethon
 flask
 nudenet
 Pillow
+gunicorn
