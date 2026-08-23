@@ -1,79 +1,54 @@
-import asyncio
-from datetime import datetime, timedelta, timezone
-import glob
-import json
 import os
-import re
-import sys
-import time
+import asyncio
 from threading import Thread
 from flask import Flask
-
-# استيراد PIL و NudeNet لفحص الصور والمحتوى
 from PIL import Image
 from nudenet import NudeDetector
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.tl.functions.channels import LeaveChannelRequest
+from telethon.tl.types import Channel, Chat
 
-# استيراد مكتبة Telethon
-import telethon
-from telethon import Button, TelegramClient, events
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
-from telethon.tl.functions.bots import SetBotCommandsRequest
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.types import BotCommand, BotCommandScopeDefault, Channel, Chat
-
-# --- إعدادات الـ API والتحكم الأساسي ---
-API_ID = 21799597
+# البيانات الخاصة بالبوت في السيرفر الجديد
+API_ID = 7226664693
 API_HASH = '4e7a8aee718c1e8e63956fec3339d01d'
-BOT_TOKEN = '8848042206:AAG1iGAxLIppkWk8ejr0tIdhUa23N5YLKYc'
-ADMIN_ID = 8111089651
+BOT_TOKEN = '8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOhC5qSA4k'
 
-# تهيئة فاحص الصور الذكي
-detector = NudeDetector()
-
-# --- سيرفر Flask المدمج لمنع توقف الخدمة في Render ---
+# --- سيرفر Flask لمنع إغلاق الخدمة من الاستضافة ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "Main Bot Service is Active and Running!"
+    return "Bot2 Cleaner Service is Online!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host='0.0.0.0', port=port)
 
-# تشغيل سيرفر Flask في مسار جانبي (Thread)
+# تشغيل الـ Web Server في الخلفية
 Thread(target=run_flask, daemon=True).start()
 
-# --- إعدادات المجلدات وملفات الأمان ---
-BASE_SESSIONS_DIR = 'sessions_users'
-ALLOWED_USERS_FILE = 'allowed_users.json'
-GLOBAL_JOINED_FILE = 'global_joined_links.txt'
-GLOBAL_WA_FILE = 'global_wa_links.txt'
-SHARED_PRIVATE_FILE = 'shared_private_groups.txt'
-LEAVE_LOCKED_SETTINGS_FILE = 'leave_locked_settings.json'
-
-TG_LINK_REGEX = r'(https?://(?:t\.me|telegram\.me)/(?:joinchat/|\+)?[\w-]+)'
-WA_LINK_REGEX = r'(https?://chat\.whatsapp\.com/[\w-]+)'
-
-# الكلمات الإباحية للفلترة النصية
+# --- قائمة الكلمات والتصنيفات ---
 EXPLICIT_KEYWORDS = [
-    'سكس', 'إباحي', 'اباحي', 'سكسي', 'تعري', 'مقاطع 18', 'افلام 18', 'شرموطة', 'زب', 
-    'كس', 'نياك', 'طيز', 'نيك', 'قحبة', 'سحاق', 'ورعان', 'موجب', 'سالب', 'ديوث',
-    'porn', 'sex', 'nsfw', 'xvideo', 'hentai', 'xnxx', 'erotic', 'adult 18+',
-    'paja', 'placer', 'caliente', 'squirt', 'modelos', 'las girls', 'nude', 'xxx',
-    'onlyfans', 'leak', 'stripper', 'hot', 'topless', 'bitch', '🔞', '💦', '🍑', '🍆', '👙'
+    "سكس", "جنس", "اباحي", "إباحي", "شرموط", "قحبة", "دعارة", "فضايح", "فضيحة",
+    "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس",
+    "porn", "paja", "placer", "caliente", "squirt", "modelos", "las girls",
+    "sex", "nude", "adult", "18+", "nsfw", "xxx", "erotic", "hentai", "vip activo",
+    "onlyfans", "leak", "stripper", "hot", "topless", "bitch",
+    "🔞", "💦", "🍑", "🍆", "👙"
 ]
 
-# تصنيفات الحظر عند فحص الصور بالذكاء الاصطناعي
 EXPLICIT_LABELS = [
     "BUTTOCKS_EXPOSED", "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED", "ANUS_EXPOSED", "MALE_BREAST_EXPOSED"
 ]
 
-if not os.path.exists(BASE_SESSIONS_DIR):
-    os.makedirs(BASE_SESSIONS_DIR)
+detector = NudeDetector()
+user_states = {}
 
-# --- دمج فحص الصور والنصوص ---
+# إنشاء كائن البوت مع جلسة مستقلة
+bot = TelegramClient('standalone_cleaner_bot', API_ID, API_HASH)
+
 def is_explicit_text(text):
     if not text:
         return False
@@ -90,199 +65,149 @@ def is_explicit_image(image_path):
         pass
     return False
 
-# --- إدارة المستخدمين والإعدادات ---
-def load_allowed_users():
-    if os.path.exists(ALLOWED_USERS_FILE):
-        with open(ALLOWED_USERS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return [ADMIN_ID]
+async def inspect_and_clean(user_client, status_msg):
+    left_count = 0
+    temp_dir = "temp_media_cleaner"
+    os.makedirs(temp_dir, exist_ok=True)
 
-def save_allowed_user(user_id):
-    users = load_allowed_users()
-    if user_id not in users:
-        users.append(user_id)
-        with open(ALLOWED_USERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(users, f)
+    async for dialog in user_client.iter_dialogs():
+        entity = dialog.entity
+        if not isinstance(entity, (Channel, Chat)):
+            continue
 
-def remove_allowed_user(user_id):
-    users = load_allowed_users()
-    if user_id in users and user_id != ADMIN_ID:
-        users.remove(user_id)
-        with open(ALLOWED_USERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(users, f)
+        title = dialog.name or ""
+        is_explicit = False
 
-def load_leave_locked_settings():
-    if os.path.exists(LEAVE_LOCKED_SETTINGS_FILE):
-        with open(LEAVE_LOCKED_SETTINGS_FILE, 'r', encoding='utf-8') as f:
+        if is_explicit_text(title):
+            is_explicit = True
+
+        if not is_explicit:
             try:
-                return json.load(f)
+                photo_path = await user_client.download_profile_photo(entity, file=os.path.join(temp_dir, "profile.jpg"))
+                if photo_path and is_explicit_image(photo_path):
+                    is_explicit = True
+                if photo_path and os.path.exists(photo_path):
+                    os.remove(photo_path)
             except Exception:
-                return {}
-    return {}
+                pass
 
-def is_leave_locked_enabled(user_id):
-    settings = load_leave_locked_settings()
-    return settings.get(str(user_id), False)
+        if not is_explicit:
+            try:
+                async for message in user_client.iter_messages(entity, limit=15):
+                    msg_text = message.text or message.caption or ""
+                    if is_explicit_text(msg_text):
+                        is_explicit = True
+                        break
 
-def set_leave_locked_setting(user_id, status: bool):
-    settings = load_leave_locked_settings()
-    settings[str(user_id)] = status
-    with open(LEAVE_LOCKED_SETTINGS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(settings, f)
+                    if message.photo:
+                        try:
+                            media_path = await message.download_media(file=os.path.join(temp_dir, "msg_media.jpg"))
+                            if media_path and is_explicit_image(media_path):
+                                is_explicit = True
+                                if os.path.exists(media_path):
+                                    os.remove(media_path)
+                                break
+                            if media_path and os.path.exists(media_path):
+                                os.remove(media_path)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-def load_list_from_file(file_path):
-    if os.path.exists(file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return [line.strip() for line in f if line.strip()]
-    return []
+        if is_explicit:
+            try:
+                await user_client(LeaveChannelRequest(entity))
+                left_count += 1
+                await status_msg.edit(f"⏳ جاري الفحص...\nتم اكتشاف ومغادرة: **{title}**\nإجمالي المغادرات حتى الآن: {left_count}")
+                await asyncio.sleep(2)
+            except Exception:
+                pass
 
-def save_to_file(file_path, data_list):
-    with open(file_path, 'w', encoding='utf-8') as f:
-        for item in data_list:
-            f.write(f'{item}\n')
+    return left_count
 
-def append_to_file(file_path, new_items):
-    data = load_list_from_file(file_path)
-    for item in new_items:
-        if item not in data:
-            data.append(item)
-    save_to_file(file_path, data)
-
-user_states = {}
-running_tasks = {}
-stop_signals = {}
-flood_expiry = {}
-join_delays = {}
-current_action_status = {}
-
-bot = TelegramClient('manager_control_bot', API_ID, API_HASH)
-
-def get_user_delay(user_id):
-    return join_delays.get(user_id, 12)
-
-def get_user_folder(user_id):
-    folder = os.path.join(BASE_SESSIONS_DIR, str(user_id))
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    return folder
-
-async def get_active_accounts(user_id):
-    user_folder = get_user_folder(user_id)
-    saved_sessions = glob.glob(f'{user_folder}/*.session')
-    return [os.path.basename(p).replace('.session', '') for p in saved_sessions]
-
-# --- تصميم لوحة التحكم ---
-def main_keyboard(user_id):
-    leave_status = "🟢 مفعل" if is_leave_locked_enabled(user_id) else "🔴 معطل"
-    kb = [
-        [
-            Button.inline('➕ إضافة حساب', b'add_acc'),
-            Button.inline('👥 الحسابات', b'manage_accs'),
-        ],
-        [
-            Button.inline('📥 إضافة ملف روابط للكل', b'add_bulk_file'),
-            Button.inline('🔗 إضافة روابط لحساب', b'add_links_menu'),
-        ],
-        [
-            Button.inline('📦 سجل الانضمام العام', b'stored_links_menu'),
-            Button.inline('📱 سجل روابط الواتس العام', b'global_wa_menu'),
-        ],
-        [
-            Button.inline('🔒 جروبات خاصة', b'view_shared_private'),
-            Button.inline(f'🚪 مغادرة المقفلة [{leave_status}]', b'toggle_leave_locked'),
-        ],
-        [
-            Button.inline('▶️ تشغيل المدير', b'start_manager'),
-            Button.inline('⏹ إيقاف المدير', b'stop_manager'),
-        ],
-        [
-            Button.inline('📊 الإحصائيات', b'view_stats'),
-            Button.inline('⏳ الانتظارات', b'view_delays'),
-        ],
-        [
-            Button.inline('♻️ استخراج يدوي للروابط', b'manual_extract'),
-            Button.inline('⚙️ الإعدادات', b'settings'),
-        ],
-        [
-            Button.inline('ℹ️ الحالة', b'system_status'),
-        ]
-    ]
-    if user_id == ADMIN_ID:
-        kb.append([Button.inline('👥 إدارة المستخدمين', b'manage_users')])
-    kb.append([Button.inline('❌ إلغاء العملية الجارية', b'cancel_state')])
-    return kb
-
-@bot.on(events.NewMessage(pattern='/start'))
+# --- معالجة أمر /start ---
+@bot.on(events.NewMessage(pattern=r'^/start'))
 async def start_handler(event):
-    user_id = event.sender_id
-    if user_id not in load_allowed_users():
-        return await event.respond('⚠️ عذراً، هذا البوت خاص.')
-
-    user_states[user_id] = None
     await event.respond(
-        '⭐ **مرحباً بك في مدير الانضمام والتنظيف الذكي للمحتوى**',
-        buttons=main_keyboard(user_id),
+        "أهلاً بك في بوت تنظيف الحسابات! 🧹\n\n"
+        "لتبدأ فحص حسابك، أرسل رقم الهاتف مع مفتاح الدولة (مثال: `+966500000000`)"
     )
 
-# --- دالة فحص وتنظيف المجموعة شاملة الوسائط والنصوص ---
-async def check_and_leave_if_inappropriate(client, user_id, phone, target, link):
-    temp_dir = "temp_media"
-    os.makedirs(temp_dir, exist_ok=True)
-    try:
-        full_entity = await client.get_entity(target)
-        title = getattr(full_entity, 'title', '')
-        
-        # 1. فحص الاسم والنص
-        if is_explicit_text(title):
-            await client(LeaveChannelRequest(full_entity))
-            await bot.send_message(user_id, f'🔞 [{phone}]: تم اكتشاف اسم إباحي -> تم المغادرة 🚪\n🔗 {link}')
-            return True
+# --- معالجة الرسائل العادية للتعامل مع تسجيل الدخول ---
+@bot.on(events.NewMessage)
+async def message_handler(event):
+    if event.text.startswith('/'):
+        return
 
-        # 2. فحص صورة البروفايل
+    chat_id = event.chat_id
+    text = event.text.strip()
+
+    # مرحلة كود التحقق
+    if chat_id in user_states and user_states[chat_id].get('step') == 'await_code':
+        data = user_states[chat_id]
+        client = data['client']
+        phone = data['phone']
+        phone_code_hash = data['phone_code_hash']
+
+        status_msg = await event.respond("جاري التحقق من الكود...")
         try:
-            photo_path = await client.download_profile_photo(full_entity, file=os.path.join(temp_dir, f"{phone}_prof.jpg"))
-            if photo_path and is_explicit_image(photo_path):
-                if os.path.exists(photo_path): os.remove(photo_path)
-                await client(LeaveChannelRequest(full_entity))
-                await bot.send_message(user_id, f'🔞 [{phone}]: تم اكتشاف صورة بروفايل إباحية -> تم المغادرة 🚪\n🔗 {link}')
-                return True
-            if photo_path and os.path.exists(photo_path): os.remove(photo_path)
-        except Exception:
-            pass
+            await client.sign_in(phone, text, phone_code_hash=phone_code_hash)
+        except Exception as e:
+            if "TWO_STEP" in str(e):
+                user_states[chat_id]['step'] = 'await_password'
+                await status_msg.edit("الحساب محمّي بكلمة سر (التحقق بخطوتين)، يرجى إرسال كلمة السر الآن:")
+                return
+            else:
+                await status_msg.edit(f"فشل التسجيل: {e}")
+                del user_states[chat_id]
+                return
 
-        # 3. فحص آخر الرسائل والصور داخل المجموعة
-        async for msg in client.iter_messages(full_entity, limit=15):
-            msg_text = msg.text or msg.caption or ""
-            if is_explicit_text(msg_text):
-                await client(LeaveChannelRequest(full_entity))
-                await bot.send_message(user_id, f'🔞 [{phone}]: تم اكتشاف نص إباحي بالرسائل -> تم المغادرة 🚪\n🔗 {link}')
-                return True
+        await status_msg.edit("تم تسجيل الدخول بنجاح! 🚀 جاري بدء فحص القنوات والمجموعات...")
+        count = await inspect_and_clean(client, status_msg)
+        await client.disconnect()
+        await status_msg.edit(f"✅ اكتمل الفحص بنجاح!\nعدد المجموعات والقنوات الإباحية التي تم الخروج منها: **{count}**")
+        del user_states[chat_id]
+        return
 
-            if msg.photo:
-                try:
-                    media_path = await msg.download_media(file=os.path.join(temp_dir, f"{phone}_msg.jpg"))
-                    if media_path and is_explicit_image(media_path):
-                        if os.path.exists(media_path): os.remove(media_path)
-                        await client(LeaveChannelRequest(full_entity))
-                        await bot.send_message(user_id, f'🔞 [{phone}]: تم اكتشاف صورة إباحية بالمجموعة -> تم المغادرة 🚪\n🔗 {link}')
-                        return True
-                    if media_path and os.path.exists(media_path): os.remove(media_path)
-                except Exception:
-                    pass
+    # مرحلة كلمة سر التحقق بخطوتين
+    elif chat_id in user_states and user_states[chat_id].get('step') == 'await_password':
+        data = user_states[chat_id]
+        client = data['client']
+        
+        status_msg = await event.respond("جاري فحص كلمة السر...")
+        try:
+            await client.sign_in(password=text)
+        except Exception as e:
+            await status_msg.edit(f"كلمة السر خاطئة: {e}")
+            return
 
-        # 4. فحص قفل الكتابة
-        if is_leave_locked_enabled(user_id):
-            if hasattr(full_entity, 'default_banned_rights') and full_entity.default_banned_rights:
-                if full_entity.default_banned_rights.send_messages:
-                    await client(LeaveChannelRequest(full_entity))
-                    await bot.send_message(user_id, f'🔒 [{phone}]: المجموعة مقفلة -> تم المغادرة 🚪\n🔗 {link}')
-                    return True
+        await status_msg.edit("تم تسجيل الدخول بنجاح! 🚀 جاري بدء فحص القنوات والمجموعات...")
+        count = await inspect_and_clean(client, status_msg)
+        await client.disconnect()
+        await status_msg.edit(f"✅ اكتمل الفحص بنجاح!\nعدد المجموعات والقنوات الإباحية التي تم الخروج منها: **{count}**")
+        del user_states[chat_id]
+        return
 
-    except Exception as e:
-        print(f"[⚠️] خطأ أثناء فحص الحساب {phone}: {e}")
-    
-    return False
+    # مرحلة إرسال رقم الهاتف
+    elif text.startswith('+') and text[1:].isdigit():
+        status_msg = await event.respond("جاري إرسال كود التحقق إلى حسابك...")
+        temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await temp_client.connect()
+        
+        try:
+            res = await temp_client.send_code_request(text)
+            user_states[chat_id] = {
+                'step': 'await_code',
+                'client': temp_client,
+                'phone': text,
+                'phone_code_hash': res.phone_code_hash
+            }
+            await status_msg.edit("تم إرسال كود التحقق عبر التلجرام. أرسل الكود هنا:")
+        except Exception as e:
+            await status_msg.edit(f"تعذر إرسال الكود: {e}")
+            await temp_client.disconnect()
 
-print("البوت يعمل الآن على Render...")
-bot.start(bot_token=BOT_TOKEN)
-bot.run_until_disconnected()
+if __name__ == '__main__':
+    print("السيرفر المستقل يعمل الآن...")
+    bot.start(bot_token=BOT_TOKEN)
+    bot.run_until_disconnected()
