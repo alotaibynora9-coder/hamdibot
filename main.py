@@ -51,18 +51,12 @@ LEAVE_LOCKED_SETTINGS_FILE = 'leave_locked_settings.json'
 TG_LINK_REGEX = r'(https?://(?:t\.me|telegram\.me)/(?:joinchat/|\+)?[\w-]+)'
 WA_LINK_REGEX = r'(https?://chat\.whatsapp\.com/[\w-]+)'
 
-NSFW_KEYWORDS = [
-    'سكس', 'إباحي', 'اباحي', 'سكسي', 'تعري', 'مقاطع 18', 'افلام 18', 'شرموطة', 'زب', 
-    'كس', 'نياك', 'طيز', 'نيك', 'قحبة', 'سحاق', 'ورعان', 'موجب', 'سالب', 'ديوث',
-    'porn', 'sex', 'nsfw', 'xvideo', 'hentai', 'xnxx', 'erotic', 'adult 18+'
-]
-
 EXPLICIT_KEYWORDS = [
     "سكس", "جنس", "اباحي", "إباحي", "شرموط", "قحبة", "دعارة", "فضايح", "فضيحة",
-    "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس",
+    "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس", "نیاك", "سحاق", "موجب", "سالب", "ديوث",
     "porn", "paja", "placer", "caliente", "squirt", "modelos", "las girls",
     "sex", "nude", "adult", "18+", "nsfw", "xxx", "erotic", "hentai", "vip activo",
-    "onlyfans", "leak", "stripper", "hot", "topless", "bitch",
+    "onlyfans", "leak", "stripper", "hot", "topless", "bitch", "xvideo", "xnxx",
     "🔞", "💦", "🍑", "🍆", "👙"
 ]
 
@@ -201,10 +195,7 @@ async def inspect_and_clean_dialogs(client, phone):
                 continue
 
             title = dialog.name or ""
-            is_explicit = False
-
-            if is_explicit_text(title):
-                is_explicit = True
+            is_explicit = is_explicit_text(title)
 
             if not is_explicit:
                 try:
@@ -942,16 +933,31 @@ async def message_handler(event):
         user_states[user_id] = None
         await event.respond('✅ تم إضافة الروابط بنجاح!', buttons=main_keyboard(user_id))
 
-async def check_and_leave_if_inappropriate(client, user_id, phone, target, link):
+async def check_and_leave_if_inappropriate(client, user_id, phone, entity, link):
     try:
-        full_entity = await client.get_entity(target)
+        full_entity = await client.get_entity(entity)
         title = getattr(full_entity, 'title', '').lower()
         
-        for kw in NSFW_KEYWORDS:
-            if kw in title:
+        # 1. فحص اسم المجموعة
+        if is_explicit_text(title):
+            await client(LeaveChannelRequest(full_entity))
+            return True
+
+        # 2. فحص الصورة الشخصية
+        try:
+            temp_photo = f"temp_profile_{phone.replace('+', '')}.jpg"
+            photo_path = await client.download_profile_photo(full_entity, file=temp_photo)
+            if photo_path and is_explicit_image(photo_path):
+                if os.path.exists(photo_path):
+                    os.remove(photo_path)
                 await client(LeaveChannelRequest(full_entity))
                 return True
+            if photo_path and os.path.exists(photo_path):
+                os.remove(photo_path)
+        except Exception:
+            pass
 
+        # 3. مغادرة المجموعات المقفلة
         if is_leave_locked_enabled(user_id):
             if hasattr(full_entity, 'default_banned_rights') and full_entity.default_banned_rights:
                 if full_entity.default_banned_rights.send_messages:
@@ -967,13 +973,18 @@ async def join_links_logic(user_id, client, phone, extracted_links, links_file, 
             break
 
         try:
+            joined_entity = None
             if 'joinchat/' in link or '+' in link:
                 hash_val = link.split('/')[-1].replace('+', '')
-                await client(ImportChatInviteRequest(hash_val))
+                updates = await client(ImportChatInviteRequest(hash_val))
+                if updates and hasattr(updates, 'chats') and updates.chats:
+                    joined_entity = updates.chats[0]
             else:
                 target = link.split('/')[-1]
-                await client(JoinChannelRequest(target))
-                await check_and_leave_if_inappropriate(client, user_id, phone, target, link)
+                joined_entity = await client(JoinChannelRequest(target))
+
+            if joined_entity:
+                await check_and_leave_if_inappropriate(client, user_id, phone, joined_entity, link)
 
             append_to_file(global_joined_path, [link])
             append_to_file(acc_joined_file, [link])
