@@ -1086,6 +1086,7 @@ async def message_handler(event):
         await event.respond(f'✅ تم إضافة **{len(filtered_links)}** رابط جديد بنجاح.', buttons=main_keyboard(user_id))
 
 # --- منطق الانضمام للروابط المطور ---
+# --- منطق الانضمام للحساب الواحد حتى الوصول للحظر المؤقت أو انتهاء الروابط ---
 async def join_links_logic(
     user_id,
     client,
@@ -1109,12 +1110,14 @@ async def join_links_logic(
             save_to_file(links_file, extracted_links)
             continue
 
-        action_str = f"📱 الحساب: `{phone}`\n🔗 الرابط: `{link}`"
+        action_str = f"📱 الحساب الحالي: `{phone}`\n🔗 الرابط: `{link}`"
         current_action_status[user_id] = action_str
         try:
             await status_msg.edit(f"⚙️ **جاري العمل الحالي:**\n{action_str}")
         except Exception:
             pass
+
+        hit_flood_wait = False
 
         try:
             if 'joinchat/' in link or '+' in link:
@@ -1125,15 +1128,21 @@ async def join_links_logic(
                     
                     if hasattr(check_res, 'already_joined') and check_res.already_joined:
                         append_to_file(shared_private_path, [link])
-                        await bot.send_message(user_id, f'🔒 [{phone}]: انضمام سابق لمجموعة خاصة ({chat_title}) -> حُفظت في القوائم الخاصة.\n🔗 {link}')
+                        await bot.send_message(user_id, f'🔒 [{phone}]: انضمام سابق لمجموعة خاصة ({chat_title}).\n🔗 {link}')
                     else:
                         await client(ImportChatInviteRequest(hash_val))
                         append_to_file(shared_private_path, [link])
                         await bot.send_message(user_id, f'🎉 [{phone}]: انضمام ناجح لمجموعة خاصة ({chat_title})! 🔒\n🔗 {link}')
 
                 except Exception as ex_inv:
-                    if "ALREADY_PARTICIPANT" in str(ex_inv):
+                    ex_str = str(ex_inv)
+                    # معالجة الانضمام المسبق وطلب الانضمام المكتمل
+                    if "USER_ALREADY_PARTICIPANT" in ex_str or "already a participant" in ex_str:
                         append_to_file(shared_private_path, [link])
+                        await bot.send_message(user_id, f'ℹ️ [{phone}]: الحساب منضم مسبقاً لهذا الرابط الخاص.\n🔗 {link}')
+                    elif "requested to join" in ex_str or "INVITE_REQUEST_SENT" in ex_str:
+                        append_to_file(shared_private_path, [link])
+                        await bot.send_message(user_id, f'📩 [{phone}]: تم إرسال طلب الانضمام وبانتظار موافقة المشرف.\n🔗 {link}')
                     else:
                         raise ex_inv
             else:
@@ -1143,8 +1152,12 @@ async def join_links_logic(
                     await client(JoinChannelRequest(ent))
                     await bot.send_message(user_id, f'🎉 [{phone}]: انضمام ناجح لـ `{target}`!\n🔗 {link}')
                 except Exception as ex_pub:
-                    if "USER_ALREADY_PARTICIPANT" in str(ex_pub):
-                        pass
+                    ex_str = str(ex_pub)
+                    # معالجة طلبات الانضمام وحالة الانضمام المسبق
+                    if "USER_ALREADY_PARTICIPANT" in ex_str or "already a participant" in ex_str:
+                        await bot.send_message(user_id, f'ℹ️ [{phone}]: الحساب منضم مسبقاً لـ `{target}`.\n🔗 {link}')
+                    elif "requested to join" in ex_str or "INVITE_REQUEST_SENT" in ex_str:
+                        await bot.send_message(user_id, f'📩 [{phone}]: تم إرسال طلب الانضمام لـ `{target}` وبانتظار الموافقة.\n🔗 {link}')
                     else:
                         raise ex_pub
 
@@ -1155,8 +1168,8 @@ async def join_links_logic(
             wait_time = e.seconds
             flood_expiry.setdefault(user_id, {})[phone] = time.time() + wait_time
             save_failed_link(user_folder, phone, link, f"حظر مؤقت لمدة {wait_time} ثانية (FloodWait)")
-            await bot.send_message(user_id, f'⏳ [{phone}]: تم الحظر المؤقت لـ {wait_time} ثانية. للانتقال للحساب التالي.')
-            break
+            await bot.send_message(user_id, f'⏳ [{phone}]: دخل حالة الانتظار/الحظر المؤقت لمدة {wait_time} ثانية.\n➡️ **جاري الانتقال فوراً للحساب التالي...**')
+            hit_flood_wait = True
 
         except Exception as e:
             save_failed_link(user_folder, phone, link, str(e))
@@ -1167,10 +1180,14 @@ async def join_links_logic(
                 extracted_links.remove(link)
                 save_to_file(links_file, extracted_links)
 
+        # الخروج فوراً للانتقال للحساب التالي عند التعرض لـ FloodWait
+        if hit_flood_wait:
+            break
+
         delay = get_user_delay(user_id)
         await asyncio.sleep(delay)
 
-# --- حلقة الانضمام التلقائي اللانهائية ---
+# --- حلقة التحكم والتنقل المتسلسل بين الحسابات ---
 async def run_infinite_loop(user_id, status_msg):
     user_folder = get_user_folder(user_id)
     global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
@@ -1188,6 +1205,7 @@ async def run_infinite_loop(user_id, status_msg):
             if stop_signals.get(user_id, False):
                 break
 
+            # تخطي الحساب إذا كان محظوراً مؤقتاً
             user_floods = flood_expiry.get(user_id, {})
             if user_floods.get(phone, 0) > time.time():
                 continue
@@ -1208,6 +1226,8 @@ async def run_infinite_loop(user_id, status_msg):
                     continue
 
                 any_link_processed = True
+                
+                # ينفذ العمليات داخل نفس الحساب حتى انتهاء روابطه أو حصول FloodWait
                 await join_links_logic(
                     user_id,
                     client,
@@ -1225,7 +1245,7 @@ async def run_infinite_loop(user_id, status_msg):
                 print(f"[⚠️] خطأ بالحساب {phone}: {e}")
 
         if not any_link_processed:
-            current_action_status[user_id] = "في انتظار روابط جديدة لجميع الحسابات..."
+            current_action_status[user_id] = "جميع الحسابات في حالة انتظار أو لا توجد روابط جديدة..."
             await asyncio.sleep(15)
 
     current_action_status[user_id] = "🔴 المدير متوقف حالياً."
