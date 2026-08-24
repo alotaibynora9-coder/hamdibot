@@ -11,8 +11,8 @@ from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.types import Channel, Chat
 
 # --- البيانات الأساسية ---
-API_ID = 7226664693
-API_HASH = '4e7a8aee718c1e8e63956fec3339d01d'
+API_ID = 30327806
+API_HASH = 'e2fddd21d8966b80eeb0fed4c37a7597'
 BOT_TOKEN = '8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOhC5qSA4k'
 
 SESSIONS_DIR = "sessions"
