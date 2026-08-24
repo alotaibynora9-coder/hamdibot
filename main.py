@@ -2,6 +2,8 @@ import os
 import glob
 import asyncio
 import urllib.request
+import unicodedata
+import re
 from threading import Thread
 from flask import Flask
 from PIL import Image
@@ -55,13 +57,13 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# --- الكلمات المخالفة ---
+# --- الكلمات المخالفة موسعة ---
 EXPLICIT_KEYWORDS = [
     "سكس", "جنس", "اباحي", "إباحي", "شرموط", "قحبة", "دعارة", "فضايح", "فضيحة",
     "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس",
-    "porn", "paja", "placer", "caliente", "squirt", "modelos", "las girls",
-    "sex", "nude", "adult", "18+", "nsfw", "xxx", "erotic", "hentai", "vip activo",
-    "onlyfans", "leak", "stripper", "hot", "topless", "bitch",
+    "porn", "paja", "placer", "caliente", "squirt", "modelos", "girls", "girl",
+    "sex", "nude", "adult", "18+", "nsfw", "xxx", "erotic", "hentai", "vip",
+    "onlyfans", "leak", "stripper", "hot", "topless", "bitch", "tanguita", "archivos",
     "🔞", "💦", "🍑", "🍆", "👙"
 ]
 
@@ -73,11 +75,28 @@ MAIN_KEYBOARD = [
     [Button.text("▶️ تشغيل الفحص", resize=True)]
 ]
 
+def normalize_text(text):
+    """إزالة الزخارف والرموز وتحويل الأحرف للنمط القياسي"""
+    if not text:
+        return ""
+    # تطبيع Unicode لإزالة التشكيل والزخارف الأحرفية
+    text = unicodedata.normalize('NFKD', text)
+    # إزالة الأشكال والرموز الملتصقة بالكلمات
+    text = re.sub(r'[^\w\s]', '', text)
+    return text.lower()
+
 def is_explicit_text(text):
     if not text:
         return False
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in EXPLICIT_KEYWORDS)
+    
+    # فحص النص الأصلي والمطهر
+    raw_text = text.lower()
+    clean_text = normalize_text(text)
+    
+    for kw in EXPLICIT_KEYWORDS:
+        if kw in raw_text or kw in clean_text:
+            return True
+    return False
 
 def is_explicit_image(image_path):
     if not session_ort:
@@ -95,7 +114,7 @@ def is_explicit_image(image_path):
         if len(outputs) > 0 and len(outputs[0]) > 0:
             for detection in outputs[0]:
                 score = detection[4] if len(detection) > 4 else 0
-                if score > 0.4:
+                if score > 0.35: # تخفيض الحساسية لالتقاط الصور المشبوهة بدقة أكبر
                     return True
     except Exception as e:
         print(f"خطأ في فحص الصورة: {e}")
@@ -132,11 +151,14 @@ async def clean_account(session_file, status_msg):
                 continue
 
             title = dialog.name or ""
+            username = getattr(entity, 'username', '') or ""
             is_explicit = False
 
-            if is_explicit_text(title):
+            # 1. فحص اسم المجموعة والمعرف (Username)
+            if is_explicit_text(title) or is_explicit_text(username):
                 is_explicit = True
 
+            # 2. فحص صورة المجموعة الشخصية
             if not is_explicit:
                 try:
                     photo_path = await client.download_profile_photo(entity, file=os.path.join(temp_dir, f"{phone}_prof.jpg"))
@@ -147,14 +169,23 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
+            # 3. فحص أحدث 30 رسالة (نصوص، توجيهات، وصور)
             if not is_explicit:
                 try:
-                    async for message in client.iter_messages(entity, limit=10):
+                    async for message in client.iter_messages(entity, limit=30):
                         msg_text = message.text or message.caption or ""
+                        
+                        # فحص النص والرسائل الموجهة (Forward Header)
                         if is_explicit_text(msg_text):
                             is_explicit = True
                             break
 
+                        if message.fwd_from and message.fwd_from.from_name:
+                            if is_explicit_text(message.fwd_from.from_name):
+                                is_explicit = True
+                                break
+
+                        # فحص وسائط الرسالة
                         if message.photo:
                             try:
                                 media_path = await message.download_media(file=os.path.join(temp_dir, f"{phone}_msg.jpg"))
@@ -170,6 +201,7 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
+            # تنفيذ المغادرة إذا ثبتت المخالفة
             if is_explicit:
                 try:
                     await client(LeaveChannelRequest(entity))
@@ -223,7 +255,7 @@ async def buttons_handler(event):
             await event.respond("⚠️ لا توجد حسابات مضافة!")
             return
 
-        status_msg = await event.respond("🚀 جاري بدء الفحص للصور والنصوص...")
+        status_msg = await event.respond("🚀 جاري بدء الفحص الشامل للصور، النصوص، والزخارف...")
         total_cleaned = 0
 
         for session_file in sessions:
@@ -236,14 +268,12 @@ async def buttons_handler(event):
 
 @bot.on(events.NewMessage)
 async def input_handler(event):
-    # تجاهل رسائل البوت نفسه
     if event.out:
         return
 
     chat_id = event.chat_id
     text = event.text.strip() if event.text else ""
 
-    # تجاهل الأوامر ونصوص الأزرار الرئيسية
     if text.startswith('/') or text in ["➕ إضافة حساب", "👥 الحسابات", "▶️ تشغيل الفحص"]:
         return
 
@@ -334,7 +364,7 @@ async def delete_account_handler(event):
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    print("البوت يعمل الآن واستجابة الأزرار مفعلة...")
+    print("البوت يعمل الآن بالميزات المحدثة...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
