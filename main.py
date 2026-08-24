@@ -15,11 +15,13 @@ from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
+    DeleteHistoryRequest,
     ImportChatInviteRequest,
 )
-from telethon.tl.types import BotCommand, BotCommandScopeDefault
+from telethon.tl.types import BotCommand, BotCommandScopeDefault, Channel, Chat, User
 
 # --- إعدادات الـ API والتحكم الأساسي ---
 API_ID = 21799597
@@ -100,7 +102,7 @@ def set_leave_locked_setting(user_id, status: bool):
     with open(LEAVE_LOCKED_SETTINGS_FILE, 'w', encoding='utf-8') as f:
         json.dump(settings, f)
 
-# --- إدارة إعدادات فحص ومغادرة الضارة التلقائي ---
+# --- إدارة إعدادات فحص ومغادرة الجروبات والقنوات والبوتات ---
 def load_nsfw_scanner_settings():
     if os.path.exists(NSFW_SCANNER_SETTINGS_FILE):
         with open(NSFW_SCANNER_SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -202,7 +204,7 @@ def main_keyboard(user_id):
             Button.inline(f'🚪 مغادرة المقفلة [{leave_status}]', b'toggle_leave_locked'),
         ],
         [
-            Button.inline(f'🛡️ فحص ومغادرة الجروبات [{nsfw_status}]', b'toggle_nsfw_scanner'),
+            Button.inline(f'🛡️ فحص ومغادرة (جروبات/قنوات/بوتات) [{nsfw_status}]', b'toggle_nsfw_scanner'),
         ],
         [
             Button.inline('▶️ تشغيل المدير', b'start_manager'),
@@ -275,7 +277,7 @@ async def start_handler(event):
     user_states[user_id] = None
     await event.respond(
         '⭐ **مرحباً بك في مدير الانضمام والاستخراج التلقائي المطور**\n\n'
-        'تم تفعيل نظام الفحص السريع لأسماء الجروبات والقنوات، التوزيع، والانضمام الدائري المستمر.',
+        'تم تفعيل نظام الفحص السريع لأسماء الجروبات والقنوات والبوتات، والتوزيع والتنقل الدائري المستمر.',
         buttons=main_keyboard(user_id),
     )
 
@@ -380,71 +382,81 @@ async def run_full_extraction_and_distribute(user_id):
 
     return total_tg, total_wa
 
-async def scheduled_daily_extraction():
-    while True:
-        now = datetime.now()
-        next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        wait_seconds = (next_run - now).total_seconds()
-
-        await asyncio.sleep(wait_seconds)
-
-        allowed_users = load_allowed_users()
-        for user_id in allowed_users:
-            try:
-                tg, wa = await run_full_extraction_and_distribute(user_id)
-                await bot.send_message(
-                    user_id,
-                    '🕒 **تقرير الاستخراج التلقائي اليومي:**\n\n✅ تم'
-                    ' فحص محادثات 24 ساعة الماضية وتوزيع الروابط:\n•'
-                    f' `{tg}` رابط تلجرام جديد.\n• `{wa}` رابط واتساب جديد.',
-                )
-            except Exception as e:
-                print(f'[⚠️] فشل الاستخراج التلقائي للمستخدم {user_id}: {e}')
-
-# --- معالجة وشروط المغادرة بحسب لغة الاسم فقط ---
-def process_group_name_rules(title):
+# --- الدالة المعدلة لشروط الاسم واللغة ---
+def process_name_rules(title):
     has_arabic = bool(re.search(r'[\u0600-\u06FF]', title))
     has_english = bool(re.search(r'[a-zA-Z]', title))
     title_lower = title.lower()
 
-    # 1. إذا كان الاسم يحتوي على كلمات إباحية يغادره فوراً
+    # 1. كلمات إباحية / ضارة -> مغادرة مباشرة
     for kw in NSFW_KEYWORDS:
         if kw in title_lower:
             return True, "اسم يحتوي على كلمات إباحية/ضارة"
 
-    # 2. إذا كان إنجليزي فقط (بدون أي حروف عربية) -> مغادرة فورية
+    # 2. إنجليزي فقط (بدون أي حرف عربي) -> مغادرة
     if has_english and not has_arabic:
-        return True, "اسم الجروب/القناة باللغة الإنجليزية بالكامل"
+        return True, "الاسم إنجليزي بالكامل"
 
-    # 3. إذا كان الاسم مخلوط (عربي + إنجليزي) أو عربي فقط -> عدم المغادرة (False)
+    # 3. عربي فقط أو مخلوط (عربي + إنجليزي) -> عدم المغادرة
     return False, ""
 
-# --- فحص ومغادرة المحادثات العامة وفق الشروط المقررة ---
-async def check_and_leave_if_inappropriate_general(client, user_id, phone, dialog):
+# --- فحص ومغادرة (الجروبات، القنوات، البوتات) ---
+async def check_and_leave_entity(client, user_id, phone, dialog):
     try:
         entity = dialog.entity
         title = dialog.name or ""
         
-        should_leave, reason = process_group_name_rules(title)
+        # تحديد نوع المحادثة
+        entity_type_str = "مجموعة"
+        is_bot = False
+        
+        if isinstance(entity, User) and entity.bot:
+            entity_type_str = "🤖 بوت"
+            is_bot = True
+        elif isinstance(entity, Channel):
+            if entity.broadcast:
+                entity_type_str = "📢 قناة"
+            else:
+                entity_type_str = "👥 مجموعة"
+        elif isinstance(entity, Chat):
+            entity_type_str = "👥 مجموعة"
+        else:
+            return False
+
+        # فحص الشروط على الاسم
+        should_leave, reason = process_name_rules(title)
+        
         if should_leave:
-            await client(LeaveChannelRequest(entity))
-            await bot.send_message(user_id, f'🚪 **[{phone}]**: تم مغادرة المجموعة/القناة\n📌 **الاسم:** {title}\n📝 **السبب:** {reason}')
+            if is_bot:
+                # إذا كان بوت يتم حظره وحذف المحادثة
+                await client(BlockRequest(entity.id))
+                await client(DeleteHistoryRequest(peer=entity, max_id=0, revoke=True))
+            else:
+                # إذا كانت قناة أو مجموعة يتم المغادرة
+                await client(LeaveChannelRequest(entity))
+                
+            await bot.send_message(
+                user_id, 
+                f'🚪 [{phone}]: تم التخلص من {entity_type_str}\n📌 **الاسم:** {title}\n📝 **السبب:** {reason}'
+            )
             return True
 
-        # فحص إقفال المجموعات إن كان الخيار مفعلاً
-        if is_leave_locked_enabled(user_id):
+        # فحص المجموعات المقفلة (الكتابة معطلة)
+        if is_leave_locked_enabled(user_id) and not is_bot:
             if hasattr(entity, 'default_banned_rights') and entity.default_banned_rights:
-                rights = entity.default_banned_rights
-                if rights.send_messages:
+                if entity.default_banned_rights.send_messages:
                     await client(LeaveChannelRequest(entity))
-                    await bot.send_message(user_id, f'🔒 **[{phone}]**: مجموعة مقفلة لا تسمح بالكتابة\n📌 **المجموعة:** {title} -> تم المغادرة 🚪')
+                    await bot.send_message(
+                        user_id, 
+                        f'🔒 [{phone}]: {entity_type_str} مقفلة لا تسمح بالكتابة\n📌 **الاسم:** {title} -> تم المغادرة 🚪'
+                    )
                     return True
 
     except Exception as e:
-        print(f"[⚠️] خطأ أثناء الفحص التلقائي للحساب {phone}: {e}")
+        print(f"[⚠️] خطأ أثناء فحص {dialog.name} للحساب {phone}: {e}")
     return False
 
-# --- محرك الفحص السريع والدوري للتنقل بين الحسابات دون توقف ---
+# --- حلقة الفحص والتنقل الدوري بين الحسابات ---
 async def run_nsfw_scanner_loop(user_id):
     while is_nsfw_scanner_enabled(user_id):
         accounts = await get_active_accounts(user_id)
@@ -469,24 +481,22 @@ async def run_nsfw_scanner_loop(user_id):
                     await client.disconnect()
                     continue
 
-                # فحص سريع للمجموعات والقنوات المشترك بها الحساب
-                async for dialog in client.iter_dialogs(limit=100):
+                # قراءة أحدث المحادثات (جروبات/قنوات/بوتات)
+                async for dialog in client.iter_dialogs(limit=60):
                     if not is_nsfw_scanner_enabled(user_id):
                         break
                     
-                    entity = dialog.entity
-                    if isinstance(entity, (telethon.tl.types.Channel, telethon.tl.types.Chat)):
-                        await check_and_leave_if_inappropriate_general(client, user_id, phone, dialog)
-                        await asyncio.sleep(0.05)  # فحص سريع جداً
+                    await check_and_leave_entity(client, user_id, phone, dialog)
+                    await asyncio.sleep(0.05)  # فحص سريع جداً
 
                 await client.disconnect()
             except Exception as e:
-                print(f"[⚠️] حدث خطأ أو انتظار في الحساب {phone}، الانتقال الفوري للحساب التالي: {e}")
+                print(f"[⚠️] تنقل للحساب التالي بعد خطأ/حظر في {phone}: {e}")
 
-            # التنقل المباشر والسريع للحساب التالي
-            await asyncio.sleep(0.5)
+            # الانتقال الفوري والسلس للحساب التالي
+            await asyncio.sleep(0.3)
 
-        # التكرار والدوران الدائم
+        # إعادة الدورة تلقائياً من الحساب الأول
         await asyncio.sleep(1)
 
 @bot.on(events.CallbackQuery)
@@ -530,11 +540,11 @@ async def callback_handler(event):
         if new_status:
             if not nsfw_scanner_tasks.get(user_id) or nsfw_scanner_tasks[user_id].done():
                 nsfw_scanner_tasks[user_id] = asyncio.create_task(run_nsfw_scanner_loop(user_id))
-            await event.answer("تم تفعيل الفحص التلقائي والدوري لأسماء القنوات والجروبات ✅", alert=True)
+            await event.answer("تم تفعيل الفحص التلقائي والمغادرة للجروبات/القنوات/البوتات ✅", alert=True)
         else:
             if user_id in nsfw_scanner_tasks:
                 nsfw_scanner_tasks[user_id].cancel()
-            await event.answer("تم إيقاف فحص أسماء القنوات والجروبات 🔴", alert=True)
+            await event.answer("تم إيقاف نظام فحص الجروبات/القنوات/البوتات 🔴", alert=True)
 
         await event.edit('⭐ **اللوحة الرئيسية للتحكم:**', buttons=main_keyboard(user_id))
 
@@ -1056,28 +1066,33 @@ async def message_handler(event):
         user_states[user_id] = None
         await event.respond(f'✅ تم إضافة **{len(filtered_links)}** رابط جديد بنجاح.', buttons=main_keyboard(user_id))
 
-# --- فحص المحتوى للجروبات/القنوات المنضم إليها حديثاً ---
+# --- فحص المحتوى للجروبات المنضم إليها حديثاً ---
 async def check_and_leave_if_inappropriate(client, user_id, phone, target, link):
     try:
         full_entity = await client.get_entity(target)
-        title = getattr(full_entity, 'title', '') or ''
+        title = getattr(full_entity, 'title', '') or getattr(full_entity, 'first_name', '') or ''
         
-        should_leave, reason = process_group_name_rules(title)
+        should_leave, reason = process_name_rules(title)
         if should_leave:
-            await client(LeaveChannelRequest(full_entity))
-            await bot.send_message(user_id, f'🚪 **[{phone}]**: تم المغادرة\n📌 **الاسم:** {title}\n📝 **السبب:** {reason}\n🔗 {link}')
+            if isinstance(full_entity, User) and full_entity.bot:
+                await client(BlockRequest(full_entity.id))
+                await client(DeleteHistoryRequest(peer=full_entity, max_id=0, revoke=True))
+            else:
+                await client(LeaveChannelRequest(full_entity))
+                
+            await bot.send_message(user_id, f'🚪 [{phone}]: تم المغادرة\n📌 **الاسم:** {title}\n📝 **السبب:** {reason}\n🔗 {link}')
             return True
 
-        if is_leave_locked_enabled(user_id):
+        if is_leave_locked_enabled(user_id) and not (isinstance(full_entity, User) and full_entity.bot):
             if hasattr(full_entity, 'default_banned_rights') and full_entity.default_banned_rights:
                 rights = full_entity.default_banned_rights
                 if rights.send_messages:
                     await client(LeaveChannelRequest(full_entity))
-                    await bot.send_message(user_id, f'🔒 **[{phone}]**: مجموعة مقفلة لا تسمح بالكتابة\n📌 **الاسم:** {title} -> تم المغادرة 🚪\n🔗 {link}')
+                    await bot.send_message(user_id, f'🔒 [{phone}]: مجموعة مقفلة لا تسمح بالكتابة\n📌 **الاسم:** {title} -> تم المغادرة 🚪\n🔗 {link}')
                     return True
 
     except Exception as e:
-        print(f"[⚠️] خطأ أثناء فحص اسم الجروب للحساب {phone}: {e}")
+        print(f"[⚠️] خطأ أثناء الفحص المباشر للحساب {phone}: {e}")
     return False
 
 # --- منطق الانضمام للروابط المطور ---
@@ -1144,28 +1159,26 @@ async def join_links_logic(
                 await bot.send_message(user_id, f'✅ [{phone}]: انضمام ناجح لـ `{target_title}`.\n🔗 {link}')
                 await check_and_leave_if_inappropriate(client, user_id, phone, target, link)
 
-            # تسجيل الانضمام والاحتفاظ بالقائمة
             append_to_file(global_joined_path, [link])
             append_to_file(acc_joined_file, [link])
             extracted_links.remove(link)
             save_to_file(links_file, extracted_links)
 
-            # تطبيق زمن الانتظار المحدد بين كل عملية انضمام
-            delay = get_user_delay(user_id)
-            await asyncio.sleep(delay)
+            wait_time = get_user_delay(user_id)
+            current_action_status[user_id] = f"⏳ انتظار الفاصل ({wait_time} ثانية)..."
+            await asyncio.sleep(wait_time)
 
         except FloodWaitError as e:
-            wait_time = e.seconds
-            flood_expiry.setdefault(user_id, {})[phone] = time.time() + wait_time
-            await bot.send_message(user_id, f'⏳ [{phone}]: حظر مؤقت (FloodWait) لمدة `{wait_time}` ثانية. الانتقال للحساب التالي...')
+            flood_expiry.setdefault(user_id, {})[phone] = time.time() + e.seconds
+            await bot.send_message(user_id, f'⏳ [{phone}]: تم حظر الانضمام المؤقت. تعليق الحساب لمدة {e.seconds} ثانية.')
             break
+
         except Exception as e:
             save_failed_link(user_folder, phone, link, str(e))
             extracted_links.remove(link)
             save_to_file(links_file, extracted_links)
-            await bot.send_message(user_id, f'❌ [{phone}]: فشل الانضمام للرابط `{link}`.\nالسبب: `{str(e)}`')
+            await bot.send_message(user_id, f'❌ [{phone}]: فشل الانضمام للرابط `{link}`\nالسبب: `{str(e)}`')
 
-# --- حلقة التنفيذ غير المنتهية للمدير ---
 async def run_infinite_loop(user_id, status_msg):
     user_folder = get_user_folder(user_id)
     global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
@@ -1173,11 +1186,11 @@ async def run_infinite_loop(user_id, status_msg):
     while not stop_signals.get(user_id, False):
         accounts = await get_active_accounts(user_id)
         if not accounts:
-            current_action_status[user_id] = "لا توجد حسابات نشطة متوفرة."
+            current_action_status[user_id] = "❌ لا توجد حسابات مضافة لتشغيل المحرك."
             await asyncio.sleep(10)
             continue
 
-        any_joined_in_round = False
+        any_link_processed = False
 
         for phone in accounts:
             if stop_signals.get(user_id, False):
@@ -1194,6 +1207,7 @@ async def run_infinite_loop(user_id, status_msg):
             if not extracted_links:
                 continue
 
+            any_link_processed = True
             session_file = os.path.join(user_folder, f'{phone}.session')
             client = TelegramClient(session_file, API_ID, API_HASH)
 
@@ -1214,43 +1228,39 @@ async def run_infinite_loop(user_id, status_msg):
                     user_folder,
                     status_msg,
                 )
-
                 await client.disconnect()
-                any_joined_in_round = True
 
             except Exception as e:
-                print(f"[⚠️] خطأ عام في تشغيل الحساب {phone}: {e}")
+                print(f"[⚠️] خطأ عام في تشغيل حساب {phone}: {e}")
 
-        if not any_joined_in_round:
-            current_action_status[user_id] = "جميع الروابط للحسابات منتهية أو الحسابات في حالة انتظار."
-            await asyncio.sleep(15)
+        if not any_link_processed:
+            current_action_status[user_id] = "💤 جميع الحسابات أتمت روابطها أو في انتظار حظر مؤقت."
+            await asyncio.sleep(10)
 
-    current_action_status[user_id] = "متوقف"
+    current_action_status[user_id] = "🔴 المدير متوقف حالياً."
     try:
-        await status_msg.edit('⏹ **تم إيقاف عمل المدير بنجاح.**')
+        await status_msg.edit("⏹ **تم إيقاف محرك الانضمام بنجاح.**")
     except Exception:
         pass
 
-# --- تشغيل التطبيق والسيرفر المدمج ---
-def start_flask_thread():
-    thread = Thread(target=run_flask)
-    thread.daemon = True
-    thread.start()
-
 async def main():
-    start_flask_thread()
-    await set_bot_commands()
-    asyncio.create_task(scheduled_daily_extraction())
+    # تشغيل سيرفر Flask
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
 
-    # إعادة تشغيل الفحص للمستخدمين المفعّلين مسبقاً عند إعادة تشغيل السكربت
+    await bot.start(bot_token=BOT_TOKEN)
+    await set_bot_commands()
+    
+    # إعادة تشغيل الفاحص للحسابات المفعّلة سابقاً عند إعادة التشغيل
     allowed_users = load_allowed_users()
     for u_id in allowed_users:
         if is_nsfw_scanner_enabled(u_id):
             nsfw_scanner_tasks[u_id] = asyncio.create_task(run_nsfw_scanner_loop(u_id))
 
-    print("🚀 Bot Started Successfully!")
+    asyncio.create_task(scheduled_daily_extraction())
+    print("🚀 Bot Engine Started Successfully!")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    bot.start(bot_token=BOT_TOKEN)
-    bot.loop.run_until_complete(main())
+    asyncio.run(main())
