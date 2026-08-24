@@ -42,7 +42,7 @@ if os.path.exists(MODEL_PATH):
     except Exception as e:
         print(f"فشل إعداد نموذج ONNX: {e}")
 
-# --- سيرفر Flask لتجاوز Health Check في Railway ---
+# --- سيرفر Flask لمنع توقف الخدمة ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -186,11 +186,15 @@ async def clean_account(session_file, status_msg):
 # --- الأحداث والردود ---
 @bot.on(events.NewMessage(pattern=r'^/start'))
 async def start_handler(event):
+    if event.out:
+        return
     user_states[event.chat_id] = None
     await event.respond("أهلاً بك! اختر من الأزرار بالأسفل للبدء:", buttons=MAIN_KEYBOARD)
 
 @bot.on(events.NewMessage(pattern=r'^(➕ إضافة حساب|👥 الحسابات|▶️ تشغيل الفحص)$'))
 async def buttons_handler(event):
+    if event.out:
+        return
     chat_id = event.chat_id
     text = event.text.strip()
 
@@ -232,9 +236,14 @@ async def buttons_handler(event):
 
 @bot.on(events.NewMessage)
 async def input_handler(event):
-    chat_id = event.chat_id
-    text = event.text.strip()
+    # تجاهل رسائل البوت نفسه
+    if event.out:
+        return
 
+    chat_id = event.chat_id
+    text = event.text.strip() if event.text else ""
+
+    # تجاهل الأوامر ونصوص الأزرار الرئيسية
     if text.startswith('/') or text in ["➕ إضافة حساب", "👥 الحسابات", "▶️ تشغيل الفحص"]:
         return
 
