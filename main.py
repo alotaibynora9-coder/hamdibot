@@ -16,7 +16,7 @@ from telethon.tl.types import Channel, Chat
 API_ID = 7226664693
 API_HASH = '4e7a8aee718c1e8e63956fec3339d01d'
 BOT_TOKEN = '8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOhC5qSA4k'
-
+ADMIN_ID =7226664693
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
