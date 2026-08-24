@@ -1,7 +1,6 @@
 import os
 import glob
 import asyncio
-import urllib.request
 import unicodedata
 import re
 from threading import Thread
@@ -22,18 +21,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOh
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# --- تحميل نموذج ONNX ---
+# --- تحميل نموذج ONNX (محلي إن وجد لتجنب أخطاء الرابط) ---
 MODEL_PATH = "detector.onnx"
-MODEL_URL = "https://github.com/nottyo/NudeNet/releases/download/v0.0/detector.onnx"
-
-if not os.path.exists(MODEL_PATH):
-    print("جاري تحميل نموذج الفحص...")
-    try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print("تم تحميل النموذج بنجاح!")
-    except Exception as e:
-        print(f"⚠️ تعذر تحميل النموذج تلقائياً: {e}")
-
 session_ort = None
 if os.path.exists(MODEL_PATH):
     try:
@@ -67,7 +56,7 @@ EXPLICIT_KEYWORDS = [
     "🔞", "💦", "🍑", "🍆", "👙"
 ]
 
-# --- الكلمات الأكاديمية والطلابية المستثناة (لا يغادر المجموعة أبداً إذا وجدت) ---
+# --- الكلمات الأكاديمية والطلابية المستثناة ---
 ACADEMIC_KEYWORDS = [
     "university", "college", "student", "students", "study", "studying", "exam", "exams",
     "lecture", "lectures", "homework", "assignment", "class", "classes", "course", "courses",
@@ -80,10 +69,11 @@ ACADEMIC_KEYWORDS = [
 
 bot = TelegramClient('official_cleaner_bot', API_ID, API_HASH)
 user_states = {}
+active_scans = {}  # لتتبع حالة الفحص وإيقافه
 
 MAIN_KEYBOARD = [
     [Button.text("➕ إضافة حساب", resize=True), Button.text("👥 الحسابات", resize=True)],
-    [Button.text("▶️ تشغيل الفحص", resize=True)]
+    [Button.text("▶️ تشغيل الفحص", resize=True), Button.text("⏹ إيقاف التشغيل", resize=True)]
 ]
 
 def normalize_text(text):
@@ -94,7 +84,6 @@ def normalize_text(text):
     return text.lower()
 
 def is_academic(text):
-    """التحقق مما إذا كان النص يتعلق بالجامعات أو التعليم أو الطلاب"""
     if not text:
         return False
     clean_text = normalize_text(text)
@@ -108,23 +97,18 @@ def is_explicit_text(text):
     if not text:
         return False
     
-    # إذا كانت المجموعة أو الرسالة تحتوي على كلمات أكاديمية، نعتبرها صالحة تماماً ولا نغادرها
     if is_academic(text):
         return False
 
     raw_text = text.lower()
     clean_text = normalize_text(text)
     
-    # فحص الكلمات الإباحية الواضحة
     for kw in EXPLICIT_KEYWORDS:
         if kw in raw_text or kw in clean_text:
             return True
 
-    # فحص الكتابة الإنجليزية العشوائية والمشبوهة (التي لا تحمل معنى أكاديمي وتحتوي على كلمات ترويجية أو غريبة)
-    # مثلاً: جمل إنجليزية غير مفهومة أو مريبة لا تخص الدراسة
     english_words = re.findall(r'[a-zA-Z]+', raw_text)
     if len(english_words) > 3:
-        # إذا كانت الإنجليزية كثيرة ولا تحتوي على أي مصطلح أكاديمي، نتحقق من وجود إشارات مريبة
         suspicious_en = ["hot", "girls", "vip", "chat", "join", "link", "t.me", "channels", "group"]
         if any(s in raw_text for s in suspicious_en):
             return True
@@ -153,7 +137,7 @@ def is_explicit_image(image_path):
         print(f"خطأ في فحص الصورة: {e}")
     return False
 
-async def clean_account(session_file, status_msg):
+async def clean_account(session_file, status_msg, chat_id):
     phone = os.path.basename(session_file).replace('.session', '')
     try:
         with open(session_file, 'r', encoding='utf-8') as f:
@@ -179,6 +163,10 @@ async def clean_account(session_file, status_msg):
 
     try:
         async for dialog in client.iter_dialogs():
+            # التحقق مما إذا طلب المستخدم إيقاف التشغيل
+            if not active_scans.get(chat_id, True):
+                break
+
             entity = dialog.entity
             if not isinstance(entity, (Channel, Chat)):
                 continue
@@ -186,18 +174,15 @@ async def clean_account(session_file, status_msg):
             title = dialog.name or ""
             username = getattr(entity, 'username', '') or ""
             
-            # حماية المجموعات الأكاديمية والتعليمية تلقائياً
             if is_academic(title) or is_academic(username):
                 continue
 
             is_explicit = False
 
-            # 1. فحص اسم المجموعة والمعرف
             if is_explicit_text(title) or is_explicit_text(username):
                 is_explicit = True
 
-            # 2. فحص صورة المجموعة الشخصية
-            if not is_explicit:
+            if not is_explicit and session_ort:
                 try:
                     photo_path = await client.download_profile_photo(entity, file=os.path.join(temp_dir, f"{phone}_prof.jpg"))
                     if photo_path and is_explicit_image(photo_path):
@@ -207,13 +192,14 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
-            # 3. فحص أحدث 30 رسالة
             if not is_explicit:
                 try:
                     async for message in client.iter_messages(entity, limit=30):
+                        if not active_scans.get(chat_id, True):
+                            break
+
                         msg_text = message.text or message.caption or ""
                         
-                        # إذا وجدنا رسالة أكاديمية داخل المجموعة، فهذا دليل على أن المجموعة تعليمية وليست إباحية
                         if is_academic(msg_text):
                             is_explicit = False
                             break
@@ -222,7 +208,7 @@ async def clean_account(session_file, status_msg):
                             is_explicit = True
                             break
 
-                        if message.photo:
+                        if message.photo and session_ort:
                             try:
                                 media_path = await message.download_media(file=os.path.join(temp_dir, f"{phone}_msg.jpg"))
                                 if media_path and is_explicit_image(media_path):
@@ -237,8 +223,7 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
-            # تنفيذ المغادرة للمجموعات المخالفة فقط
-            if is_explicit:
+            if is_explicit and active_scans.get(chat_id, True):
                 try:
                     await client(LeaveChannelRequest(entity))
                     left_count += 1
@@ -257,9 +242,10 @@ async def start_handler(event):
     if event.out:
         return
     user_states[event.chat_id] = None
+    active_scans[event.chat_id] = False
     await event.respond("أهلاً بك! اختر من الأزرار بالأسفل للبدء:", buttons=MAIN_KEYBOARD)
 
-@bot.on(events.NewMessage(pattern=r'^(➕ إضافة حساب|👥 الحسابات|▶️ تشغيل الفحص)$'))
+@bot.on(events.NewMessage(pattern=r'^(➕ إضافة حساب|👥 الحسابات|▶️ تشغيل الفحص|⏹ إيقاف التشغيل)$'))
 async def buttons_handler(event):
     if event.out:
         return
@@ -291,16 +277,26 @@ async def buttons_handler(event):
             await event.respond("⚠️ لا توجد حسابات مضافة!")
             return
 
-        status_msg = await event.respond("🚀 جاري بدء الفحص الذكي (مع الحفاظ على المجموعات الأكاديمية والطلابية)...")
+        active_scans[chat_id] = True
+        status_msg = await event.respond("🚀 جاري بدء الفحص الذكي... (يمكنك الإيقاف في أي وقت عبر الزر بالأسفل)")
         total_cleaned = 0
 
         for session_file in sessions:
+            if not active_scans.get(chat_id, True):
+                break
             phone = os.path.basename(session_file).replace('.session', '')
             await status_msg.edit(f"🔍 جاري فحص الحساب: `{phone}`...")
-            count = await clean_account(session_file, status_msg)
+            count = await clean_account(session_file, status_msg, chat_id)
             total_cleaned += count
 
-        await status_msg.edit(f"✅ اكتمل الفحص!\nإجمالي المجموعات التي غادرها البوت: **{total_cleaned}**")
+        if active_scans.get(chat_id, True):
+            await status_msg.edit(f"✅ اكتمل الفحص!\nإجمالي المجموعات التي غادرها البوت: **{total_cleaned}**")
+        else:
+            await status_msg.edit(f"⏹ تم إيقاف الفحص بناءً على طلبك.\nالمجموعات التي تم مغادرتها حتى الآن: **{total_cleaned}**")
+
+    elif text == "⏹ إيقاف التشغيل":
+        active_scans[chat_id] = False
+        await event.respond("⏹ تم إرسال أمر الإيقاف. سيتم إيقاف العمليات الحالية حالاً.", buttons=MAIN_KEYBOARD)
 
 @bot.on(events.NewMessage)
 async def input_handler(event):
@@ -310,7 +306,7 @@ async def input_handler(event):
     chat_id = event.chat_id
     text = event.text.strip() if event.text else ""
 
-    if text.startswith('/') or text in ["➕ إضافة حساب", "👥 الحسابات", "▶️ تشغيل الفحص"]:
+    if text.startswith('/') or text in ["➕ إضافة حساب", "👥 الحسابات", "▶️ تشغيل الفحص", "⏹ إيقاف التشغيل"]:
         return
 
     state = user_states.get(chat_id)
@@ -400,7 +396,7 @@ async def delete_account_handler(event):
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    print("البوت يعمل الآن بالفحص الذكي للاستثناءات الأكاديمية...")
+    print("البوت يعمل الآن مع زر الإيقاف وتجاوز أخطاء التحميل...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
