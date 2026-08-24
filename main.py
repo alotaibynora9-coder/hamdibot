@@ -413,7 +413,7 @@ def should_leave_based_on_name(title, username=''):
     
     has_arabic = bool(re.search(r'[\u0600-\u06FF]', title))
     if has_arabic:
-        return False  
+        return False, ""
         
     for kw in NSFW_KEYWORDS:
         if kw in full_text:
@@ -421,7 +421,7 @@ def should_leave_based_on_name(title, username=''):
             
     has_academic = any(ak in full_text for ak in ACADEMIC_KEYWORDS)
     if has_academic:
-        return False  
+        return False, ""
         
     return True, "اسم إنجليزي لا يدل على التعليم أو الجامعات أو غير مفهوم"
 
@@ -466,10 +466,15 @@ async def check_and_leave_if_inappropriate_general(client, user_id, phone, dialo
         print(f"[⚠️] خطأ أثناء الفحص التلقائي للحساب {phone}: {e}")
     return False
 
+# --- محرك الفحص والمغادرة السريع والدوري دون توقف ---
 async def run_nsfw_scanner_loop(user_id):
     while is_nsfw_scanner_enabled(user_id):
         accounts = await get_active_accounts(user_id)
         user_folder = get_user_folder(user_id)
+
+        if not accounts:
+            await asyncio.sleep(5)
+            continue
 
         for phone in accounts:
             if not is_nsfw_scanner_enabled(user_id):
@@ -493,7 +498,7 @@ async def run_nsfw_scanner_loop(user_id):
                     entity = dialog.entity
                     if isinstance(entity, (telethon.tl.types.Channel, telethon.tl.types.Chat)):
                         await check_and_leave_if_inappropriate_general(client, user_id, phone, dialog)
-                        await asyncio.sleep(0.3)  # سرعة عالية وتقليل الانتظار بين المجموعات
+                        await asyncio.sleep(0.3)
 
                 await client.disconnect()
             except Exception as e:
@@ -501,10 +506,7 @@ async def run_nsfw_scanner_loop(user_id):
 
             await asyncio.sleep(1)
 
-        for _ in range(300):
-            if not is_nsfw_scanner_enabled(user_id):
-                break
-            await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
