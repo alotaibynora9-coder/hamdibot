@@ -56,6 +56,13 @@ NSFW_KEYWORDS = [
     'porn', 'sex', 'nsfw', 'xvideo', 'hentai', 'xnxx', 'erotic', 'adult 18+'
 ]
 
+# كلمات مفتاحية دالة على التعليم والجامعات والأبحاث باللغة الإنجليزية
+ACADEMIC_KEYWORDS = [
+    'university', 'college', 'study', 'student', 'students', 'academic', 'education', 
+    'homework', 'thesis', 'research', 'class', 'school', 'learning', 'assignment', 
+    'lecture', 'course', 'campus', 'edu', 'sci', 'grad', 'bachelor', 'master'
+]
+
 if not os.path.exists(BASE_SESSIONS_DIR):
     os.makedirs(BASE_SESSIONS_DIR)
 
@@ -401,6 +408,29 @@ async def scheduled_daily_extraction():
             except Exception as e:
                 print(f'[⚠️] فشل الاستخراج التلقائي للمستخدم {user_id}: {e}')
 
+# --- دالة مساعدة لفحص اسم المجموعة وفقاً للشروط المطلوبة ---
+def should_leave_based_on_name(title, username=''):
+    full_text = (title + " " + username).lower()
+    
+    # التحقق مما إذا كان الاسم يحتوي على حروف عربية (إذا وجد عربي، لا يغادر بناءً على الاسم الإنجليزي)
+    has_arabic = bool(re.search(r'[\u0600-\u06FF]', title))
+    if has_arabic:
+        return False  # اسم يحتوي على عربي وغير إنجليزي فقط -> لا يغادر
+        
+    # فحص الكلمات الإباحية أو الضارة
+    for kw in NSFW_KEYWORDS:
+        if kw in full_text:
+            return True, "تطابق كلمات إباحية/ضارة"
+            
+    # التحقق مما إذا كان الاسم باللغة الإنجليزية بالكامل
+    # هل يحتوي على كلمات دالة على التعليم أو الجامعات؟
+    has_academic = any(ak in full_text for ak in ACADEMIC_KEYWORDS)
+    if has_academic:
+        return False  # اسم إنجليزي دال على التعليم -> لا يغادر
+        
+    # إذا كان الاسم إنجليزي بالكامل (أو رموز/أبرمجيات غير مفهومة) ولا يحتوي على أي دلالة تعليمية
+    return True, "اسم إنجليزي لا يدل على التعليم أو الجامعات أو غير مفهوم"
+
 # --- محرك الفحص والمغادرة الدوري التلقائي في الخلفية ---
 async def check_and_leave_if_inappropriate_general(client, user_id, phone, dialog):
     try:
@@ -408,34 +438,34 @@ async def check_and_leave_if_inappropriate_general(client, user_id, phone, dialo
         title = dialog.name or ""
         username = getattr(entity, 'username', '') or ''
         
-        # فحص اسم الجروب واليوزر
-        for kw in NSFW_KEYWORDS:
-            if kw in title.lower() or kw in username.lower():
-                await client(LeaveChannelRequest(entity))
-                await bot.send_message(user_id, f'🔞 [{phone}]: مجموعة ضارة/إباحية (تطابق الاسم: {title}) -> تم المغادرة 🚪')
-                return True
+        # 1. فحص اسم الجروب واليوزر بناءً على الشروط الجديدة
+        should_leave, reason = should_leave_based_on_name(title, username)
+        if should_leave:
+            await client(LeaveChannelRequest(entity))
+            await bot.send_message(user_id, f'🚫 [{phone}]: مجموعة ضارة/غير تعليمية\n📌 **الاسم:** {title}\n📝 **السبب:** {reason} -> تم المغادرة 🚪')
+            return True
 
-        # فحص أحدث الرسائل داخل الجروب
+        # 2. فحص أحدث الرسائل داخل الجروب للوسائط الحساسة والكلمات الإباحية
         async for msg in client.iter_messages(entity, limit=15):
             if getattr(msg, 'has_sensitive_media', False):
                 await client(LeaveChannelRequest(entity))
-                await bot.send_message(user_id, f'🔞 [{phone}]: وسائط حساسة/إباحية في مجموعة ({title}) -> تم المغادرة 🚪')
+                await bot.send_message(user_id, f'🔞 [{phone}]: وسائط حساسة/إباحية\n📌 **المجموعة:** {title} -> تم المغادرة 🚪')
                 return True
 
             msg_text = (msg.text or '').lower()
             for kw in NSFW_KEYWORDS:
                 if kw in msg_text:
                     await client(LeaveChannelRequest(entity))
-                    await bot.send_message(user_id, f'🔞 [{phone}]: كلمات إباحية وضارة في مجموعة ({title}) -> تم المغادرة 🚪')
+                    await bot.send_message(user_id, f'🔞 [{phone}]: كلمات إباحية وضارة\n📌 **المجموعة:** {title} -> تم المغادرة 🚪')
                     return True
 
-        # فحص إقفال المجموعات إذا كان المفعل
+        # 3. فحص إقفال المجموعات إذا كان مفَعلاً
         if is_leave_locked_enabled(user_id):
             if hasattr(entity, 'default_banned_rights') and entity.default_banned_rights:
                 rights = entity.default_banned_rights
                 if rights.send_messages:
                     await client(LeaveChannelRequest(entity))
-                    await bot.send_message(user_id, f'🔒 [{phone}]: مجموعة مقفلة ولا تسمح بالكتابة ({title}) -> تم المغادرة 🚪')
+                    await bot.send_message(user_id, f'🔒 [{phone}]: مجموعة مقفلة ولا تسمح بالكتابة\n📌 **المجموعة:** {title} -> تم المغادرة 🚪')
                     return True
 
     except Exception as e:
@@ -469,7 +499,7 @@ async def run_nsfw_scanner_loop(user_id):
                     entity = dialog.entity
                     if isinstance(entity, (telethon.tl.types.Channel, telethon.tl.types.Chat)):
                         await check_and_leave_if_inappropriate_general(client, user_id, phone, dialog)
-                        await asyncio.sleep(2) # فاصل صغير بين فحص كل مجموعة لتجنب الضغط
+                        await asyncio.sleep(2)
 
                 await client.disconnect()
             except Exception as e:
@@ -477,7 +507,6 @@ async def run_nsfw_scanner_loop(user_id):
 
             await asyncio.sleep(5)
 
-        # الانتظار لمدة ساعة قبل إعادة دورة الفحص الشامل لجميع الحسابات تفادياً للحظر
         for _ in range(3600):
             if not is_nsfw_scanner_enabled(user_id):
                 break
@@ -1053,26 +1082,28 @@ async def message_handler(event):
 async def check_and_leave_if_inappropriate(client, user_id, phone, target, link):
     try:
         full_entity = await client.get_entity(target)
-        title = getattr(full_entity, 'title', '').lower()
+        title = getattr(full_entity, 'title', '') or ''
         username = getattr(full_entity, 'username', '') or ''
         
-        for kw in NSFW_KEYWORDS:
-            if kw in title or kw in username.lower():
-                await client(LeaveChannelRequest(full_entity))
-                await bot.send_message(user_id, f'🔞 [{phone}]: المجموعة إباحية (تطابق الاسم) -> تم المغادرة 🚪\n🔗 {link}')
-                return True
+        # 1. فحص اسم المجموعة واليوزر بالشروط المحددة
+        should_leave, reason = should_leave_based_on_name(title, username)
+        if should_leave:
+            await client(LeaveChannelRequest(full_entity))
+            await bot.send_message(user_id, f'🚫 [{phone}]: مجموعة غير تعليمية/ضارة\n📌 **اسم الجروب:** {title}\n📝 **السبب:** {reason} -> تم المغادرة 🚪\n🔗 {link}')
+            return True
 
+        # 2. فحص محتوى الرسائل
         async for msg in client.iter_messages(full_entity, limit=15):
             if getattr(msg, 'has_sensitive_media', False):
                 await client(LeaveChannelRequest(full_entity))
-                await bot.send_message(user_id, f'🔞 [{phone}]: وسائط حساسة/إباحية -> تم المغادرة 🚪\n🔗 {link}')
+                await bot.send_message(user_id, f'🔞 [{phone}]: وسائط حساسة/إباحية\n📌 **اسم الجروب:** {title} -> تم المغادرة 🚪\n🔗 {link}')
                 return True
 
             msg_text = (msg.text or '').lower()
             for kw in NSFW_KEYWORDS:
                 if kw in msg_text:
                     await client(LeaveChannelRequest(full_entity))
-                    await bot.send_message(user_id, f'🔞 [{phone}]: كلمات إباحية -> تم المغادرة 🚪\n🔗 {link}')
+                    await bot.send_message(user_id, f'🔞 [{phone}]: كلمات إباحية\n📌 **اسم الجروب:** {title} -> تم المغادرة 🚪\n🔗 {link}')
                     return True
 
         if is_leave_locked_enabled(user_id):
@@ -1080,7 +1111,7 @@ async def check_and_leave_if_inappropriate(client, user_id, phone, target, link)
                 rights = full_entity.default_banned_rights
                 if rights.send_messages:
                     await client(LeaveChannelRequest(full_entity))
-                    await bot.send_message(user_id, f'🔒 [{phone}]: المجموعة مقفلة ولا تسمح بالكتابة -> تم المغادرة 🚪\n🔗 {link}')
+                    await bot.send_message(user_id, f'🔒 [{phone}]: مجموعة مقفلة ولا تسمح بالكتابة\n📌 **اسم الجروب:** {title} -> تم المغادرة 🚪\n🔗 {link}')
                     return True
 
     except Exception as e:
@@ -1141,8 +1172,15 @@ async def join_links_logic(
                         raise ex_inv
             else:
                 target = link.split('/')[-1]
+                # جلب معلومات الجروب لعرض اسمه عند النجاح
+                try:
+                    ent = await client.get_entity(target)
+                    target_title = getattr(ent, 'title', target)
+                except:
+                    target_title = target
+
                 await client(JoinChannelRequest(target))
-                await bot.send_message(user_id, f'✅ [{phone}]: انضمام ناجح لـ `{target}`.\n🔗 {link}')
+                await bot.send_message(user_id, f'✅ [{phone}]: انضمام ناجح لـ `{target_title}`.\n🔗 {link}')
                 await check_and_leave_if_inappropriate(client, user_id, phone, target, link)
 
             append_to_file(global_joined_path, [link])
@@ -1227,21 +1265,17 @@ async def run_infinite_loop(user_id, status_msg):
     current_action_status[user_id] = "🔴 المحرك متوقف حالياً."
 
 async def main():
-    # تشغيل سيرفر Flask المدمج على Thread منفصل
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # تشغيل مهمة الاستخراج التلقائي اليومي
     asyncio.create_task(scheduled_daily_extraction())
 
-    # استئناف مهام الفحص التلقائي للجروبات الضارة للمستخدمين إن كانت مفعلة سابقاً
     for user_id_str, enabled in load_nsfw_scanner_settings().items():
         if enabled:
             u_id = int(user_id_str)
             nsfw_scanner_tasks[u_id] = asyncio.create_task(run_nsfw_scanner_loop(u_id))
 
-    # تشغيل البوت الأساسي
     await bot.start(bot_token=BOT_TOKEN)
     await set_bot_commands()
     print("🤖 Main Control Bot started successfully!")
