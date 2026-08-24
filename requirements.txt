@@ -1,5 +1,7 @@
 telethon
 flask
-nudenet
-Pillow
+pillow
 gunicorn
+onnxruntime
+numpy
+requests
