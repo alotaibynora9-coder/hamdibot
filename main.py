@@ -467,6 +467,7 @@ async def check_and_leave_entity(client, user_id, phone, dialog):
     return False
 
 # --- حلقة الفحص والتنقل الدوري بين الحسابات ---
+# --- حلقة الفحص والتنقل الدوري بين الحسابات ---
 async def run_nsfw_scanner_loop(user_id):
     while is_nsfw_scanner_enabled(user_id):
         accounts = await get_active_accounts(user_id)
