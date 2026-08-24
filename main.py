@@ -57,7 +57,7 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# --- الكلمات المخالفة موسعة ---
+# --- الكلمات الإباحية والسبام ---
 EXPLICIT_KEYWORDS = [
     "سكس", "جنس", "اباحي", "إباحي", "شرموط", "قحبة", "دعارة", "فضايح", "فضيحة",
     "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس",
@@ -65,6 +65,17 @@ EXPLICIT_KEYWORDS = [
     "sex", "nude", "adult", "18+", "nsfw", "xxx", "erotic", "hentai", "vip",
     "onlyfans", "leak", "stripper", "hot", "topless", "bitch", "tanguita", "archivos",
     "🔞", "💦", "🍑", "🍆", "👙"
+]
+
+# --- الكلمات الأكاديمية والطلابية المستثناة (لا يغادر المجموعة أبداً إذا وجدت) ---
+ACADEMIC_KEYWORDS = [
+    "university", "college", "student", "students", "study", "studying", "exam", "exams",
+    "lecture", "lectures", "homework", "assignment", "class", "classes", "course", "courses",
+    "academic", "professor", "dr", "doctor", "schedule", "department", "faculty", "major",
+    "science", "sciences", "engineering", "system", "systems", "operating", "os", "cs", "it",
+    "code", "coding", "program", "programming", "math", "physics", "chemistry", "biology",
+    "جامعة", "كلية", "طلاب", "طالب", "دكتور", "محاضرة", "محاضرات", "واجب", "بحث", "اختبار",
+    "مذاكرة", "قسم", "هندسة", "نظم", "تشغيل", "برمجة", "تعليم", "تخصص", "دفعة"
 ]
 
 bot = TelegramClient('official_cleaner_bot', API_ID, API_HASH)
@@ -76,26 +87,48 @@ MAIN_KEYBOARD = [
 ]
 
 def normalize_text(text):
-    """إزالة الزخارف والرموز وتحويل الأحرف للنمط القياسي"""
     if not text:
         return ""
-    # تطبيع Unicode لإزالة التشكيل والزخارف الأحرفية
     text = unicodedata.normalize('NFKD', text)
-    # إزالة الأشكال والرموز الملتصقة بالكلمات
     text = re.sub(r'[^\w\s]', '', text)
     return text.lower()
+
+def is_academic(text):
+    """التحقق مما إذا كان النص يتعلق بالجامعات أو التعليم أو الطلاب"""
+    if not text:
+        return False
+    clean_text = normalize_text(text)
+    words = clean_text.split()
+    for word in words:
+        if word in ACADEMIC_KEYWORDS:
+            return True
+    return False
 
 def is_explicit_text(text):
     if not text:
         return False
     
-    # فحص النص الأصلي والمطهر
+    # إذا كانت المجموعة أو الرسالة تحتوي على كلمات أكاديمية، نعتبرها صالحة تماماً ولا نغادرها
+    if is_academic(text):
+        return False
+
     raw_text = text.lower()
     clean_text = normalize_text(text)
     
+    # فحص الكلمات الإباحية الواضحة
     for kw in EXPLICIT_KEYWORDS:
         if kw in raw_text or kw in clean_text:
             return True
+
+    # فحص الكتابة الإنجليزية العشوائية والمشبوهة (التي لا تحمل معنى أكاديمي وتحتوي على كلمات ترويجية أو غريبة)
+    # مثلاً: جمل إنجليزية غير مفهومة أو مريبة لا تخص الدراسة
+    english_words = re.findall(r'[a-zA-Z]+', raw_text)
+    if len(english_words) > 3:
+        # إذا كانت الإنجليزية كثيرة ولا تحتوي على أي مصطلح أكاديمي، نتحقق من وجود إشارات مريبة
+        suspicious_en = ["hot", "girls", "vip", "chat", "join", "link", "t.me", "channels", "group"]
+        if any(s in raw_text for s in suspicious_en):
+            return True
+
     return False
 
 def is_explicit_image(image_path):
@@ -114,7 +147,7 @@ def is_explicit_image(image_path):
         if len(outputs) > 0 and len(outputs[0]) > 0:
             for detection in outputs[0]:
                 score = detection[4] if len(detection) > 4 else 0
-                if score > 0.35: # تخفيض الحساسية لالتقاط الصور المشبوهة بدقة أكبر
+                if score > 0.35:
                     return True
     except Exception as e:
         print(f"خطأ في فحص الصورة: {e}")
@@ -152,9 +185,14 @@ async def clean_account(session_file, status_msg):
 
             title = dialog.name or ""
             username = getattr(entity, 'username', '') or ""
+            
+            # حماية المجموعات الأكاديمية والتعليمية تلقائياً
+            if is_academic(title) or is_academic(username):
+                continue
+
             is_explicit = False
 
-            # 1. فحص اسم المجموعة والمعرف (Username)
+            # 1. فحص اسم المجموعة والمعرف
             if is_explicit_text(title) or is_explicit_text(username):
                 is_explicit = True
 
@@ -169,23 +207,21 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
-            # 3. فحص أحدث 30 رسالة (نصوص، توجيهات، وصور)
+            # 3. فحص أحدث 30 رسالة
             if not is_explicit:
                 try:
                     async for message in client.iter_messages(entity, limit=30):
                         msg_text = message.text or message.caption or ""
                         
-                        # فحص النص والرسائل الموجهة (Forward Header)
+                        # إذا وجدنا رسالة أكاديمية داخل المجموعة، فهذا دليل على أن المجموعة تعليمية وليست إباحية
+                        if is_academic(msg_text):
+                            is_explicit = False
+                            break
+
                         if is_explicit_text(msg_text):
                             is_explicit = True
                             break
 
-                        if message.fwd_from and message.fwd_from.from_name:
-                            if is_explicit_text(message.fwd_from.from_name):
-                                is_explicit = True
-                                break
-
-                        # فحص وسائط الرسالة
                         if message.photo:
                             try:
                                 media_path = await message.download_media(file=os.path.join(temp_dir, f"{phone}_msg.jpg"))
@@ -201,7 +237,7 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
-            # تنفيذ المغادرة إذا ثبتت المخالفة
+            # تنفيذ المغادرة للمجموعات المخالفة فقط
             if is_explicit:
                 try:
                     await client(LeaveChannelRequest(entity))
@@ -255,7 +291,7 @@ async def buttons_handler(event):
             await event.respond("⚠️ لا توجد حسابات مضافة!")
             return
 
-        status_msg = await event.respond("🚀 جاري بدء الفحص الشامل للصور، النصوص، والزخارف...")
+        status_msg = await event.respond("🚀 جاري بدء الفحص الذكي (مع الحفاظ على المجموعات الأكاديمية والطلابية)...")
         total_cleaned = 0
 
         for session_file in sessions:
@@ -364,7 +400,7 @@ async def delete_account_handler(event):
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    print("البوت يعمل الآن بالميزات المحدثة...")
+    print("البوت يعمل الآن بالفحص الذكي للاستثناءات الأكاديمية...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
