@@ -9,6 +9,7 @@ import time
 from threading import Thread
 from flask import Flask
 
+# استيراد المكتبة الرئيسية والأدوات المطلوبة
 import telethon
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
@@ -276,7 +277,7 @@ async def start_handler(event):
     user_states[user_id] = None
     await event.respond(
         '⭐ **مرحباً بك في مدير الانضمام والاستخراج التلقائي المطور**\n\n'
-        'تم تفعيل نظام الفحص السريع لأسماء الجروبات والقنوات والبوتات، والتوزيع والتنقل الدائري المستمر.',
+        'تم تحديث شروط الفحص لتنظيف الحسابات ومغادرة أي مجموعات/قنوات غير عربية أو تحتوي على رموز ولغات أجنبية.',
         buttons=main_keyboard(user_id),
     )
 
@@ -381,6 +382,7 @@ async def run_full_extraction_and_distribute(user_id):
 
     return total_tg, total_wa
 
+# --- الدالة المجدولة تلقائياً يومياً ---
 async def scheduled_daily_extraction():
     while True:
         try:
@@ -393,24 +395,30 @@ async def scheduled_daily_extraction():
             print(f"[⚠️] خطأ أثناء الاستخراج المجدول: {e}")
             await asyncio.sleep(300)
 
+# --- معالجة شروط الأسماء المعدلة (الاحتفاظ فقط باللغة العربية) ---
 def process_name_rules(title):
-    has_arabic = bool(re.search(r'[\u0600-\u06FF]', title))
-    has_english = bool(re.search(r'[a-zA-Z]', title))
-    title_lower = title.lower()
+    title_strip = title.strip() if title else ""
+    title_lower = title_strip.lower()
 
+    # 1. فحص الكلمات الإباحية
     for kw in NSFW_KEYWORDS:
         if kw in title_lower:
-            return True, f"اسم يحتوي على كلمة مخالفة ({kw})"
+            return True, f"كلمة مخالفة ({kw})"
 
-    if has_english and not has_arabic:
-        return True, "الاسم إنجليزي بالكامل"
+    # 2. فحص وجود الحروف العربية (النطاق \u0600-\u06FF)
+    has_arabic = bool(re.search(r'[\u0600-\u06FF]', title_strip))
 
+    # إذا كان الاسم لا يحتوي على لغة عربية اطلاقاً (إنجليزية، رموز، لغات أخرى، أو إيموجي فقط) -> مغادرة
+    if not has_arabic:
+        return True, "الاسم لغة غير عربية / رموز / إنجليزي"
+
+    # الاسم محتفظ به لأنه يحتوي لغة عربية
     return False, ""
 
-# --- دالة الفحص الشامل لجميع المحادثات بدون حد أقصى ---
+# --- دالة الفحص المستقلة المعدلة والشاملة لجميع الجروبات ---
 async def process_standalone_scanner_for_account(client, user_id, phone):
     try:
-        # إزالة Limit ليتم فحص جميع الجروبات القائمة داخل الحساب
+        # limit=None يضمن المرور على كافة المحادثات والجروبات بالكامل دون تجاوز أي منها
         async for dialog in client.iter_dialogs(limit=None):
             if not is_nsfw_scanner_enabled(user_id):
                 break
@@ -430,8 +438,10 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
             else:
                 continue
 
+            # تطبيق شروط الفحص الجديدة
             should_leave, reason = process_name_rules(title)
 
+            # فحص الجروبات المقفلة
             if not should_leave and is_leave_locked_enabled(user_id) and not is_bot:
                 if hasattr(entity, 'default_banned_rights') and entity.default_banned_rights:
                     if entity.default_banned_rights.send_messages:
@@ -446,14 +456,15 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
                     else:
                         await client(LeaveChannelRequest(entity))
 
+                    # إرسال تقرير فوري للمستخدم
                     await bot.send_message(
                         user_id,
-                        f"🛡️ **[تم اكتشاف ومغادرة عنصر مخالف]**\n\n"
+                        f"🛡️ **[تقرير الفحص المطور]**\n\n"
                         f"📱 **الحساب:** `{phone}`\n"
                         f"📌 **الاسم:** {title}\n"
                         f"🏷️ **النوع:** {entity_type_str}\n"
                         f"📝 **السبب:** {reason}\n"
-                        f"🚪 **الإجراء:** تم المغادرة بنجاح."
+                        f"🚪 **الإجراء:** تم المغادرة/الحظر بنجاح."
                     )
                 except Exception as ex_leave:
                     print(f"[⚠️] فشل المغادرة من {title}: {ex_leave}")
@@ -461,11 +472,11 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
             await asyncio.sleep(0.02)
 
     except FloodWaitError as e:
-        print(f"[⏳] الحساب {phone} في حالة انتظار FloodWait لمدة {e.seconds} ثانية.")
+        print(f"[⏳] الحساب {phone} دخل في انتظار FloodWait لمدة {e.seconds} ثانية.")
     except Exception as e:
-        print(f"[⚠️] خطأ غير متوقع أثناء فحص الحساب {phone}: {e}")
+        print(f"[⚠️] خطأ أثناء فحص الحساب {phone}: {e}")
 
-# --- حلقة الفحص والتنقل الدوري المعدلة للتشغيل المباشر ---
+# --- حلقة التنقل السريع بين الحسابات للفحص ---
 async def run_nsfw_scanner_loop(user_id):
     while is_nsfw_scanner_enabled(user_id):
         try:
@@ -491,7 +502,7 @@ async def run_nsfw_scanner_loop(user_id):
                         await process_standalone_scanner_for_account(client, user_id, phone)
                     await client.disconnect()
                 except Exception as e:
-                    print(f"[⚠️] تجاوز الحساب {phone} بسبب خطأ: {e}")
+                    print(f"[⚠️] خطأ الاتصال بالحساب {phone}: {e}")
                     try:
                         await client.disconnect()
                     except Exception:
@@ -499,12 +510,12 @@ async def run_nsfw_scanner_loop(user_id):
 
                 await asyncio.sleep(0.1)
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"[⚠️] خطأ عام في حلقة الفحص: {e}")
+            print(f"[⚠️] خطأ في حلقة الفحص: {e}")
             await asyncio.sleep(3)
 
 @bot.on(events.CallbackQuery)
@@ -546,10 +557,9 @@ async def callback_handler(event):
         set_nsfw_scanner_setting(user_id, new_status)
         
         if new_status:
-            if user_id in nsfw_scanner_tasks and not nsfw_scanner_tasks[user_id].done():
-                nsfw_scanner_tasks[user_id].cancel()
-            nsfw_scanner_tasks[user_id] = asyncio.create_task(run_nsfw_scanner_loop(user_id))
-            await event.answer("تم تفعيل الفحص المباشر والسريع بنجاح ✅", alert=True)
+            if not nsfw_scanner_tasks.get(user_id) or nsfw_scanner_tasks[user_id].done():
+                nsfw_scanner_tasks[user_id] = asyncio.create_task(run_nsfw_scanner_loop(user_id))
+            await event.answer("تم تفعيل الفحص التلقائي المستقل والسريع ✅", alert=True)
         else:
             if user_id in nsfw_scanner_tasks:
                 nsfw_scanner_tasks[user_id].cancel()
@@ -1075,6 +1085,7 @@ async def message_handler(event):
         user_states[user_id] = None
         await event.respond(f'✅ تم إضافة **{len(filtered_links)}** رابط جديد بنجاح.', buttons=main_keyboard(user_id))
 
+# --- منطق الانضمام للروابط المطور ---
 async def join_links_logic(
     user_id,
     client,
@@ -1159,6 +1170,7 @@ async def join_links_logic(
         delay = get_user_delay(user_id)
         await asyncio.sleep(delay)
 
+# --- حلقة الانضمام التلقائي اللانهائية ---
 async def run_infinite_loop(user_id, status_msg):
     user_folder = get_user_folder(user_id)
     global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
@@ -1222,6 +1234,7 @@ async def run_infinite_loop(user_id, status_msg):
     except Exception:
         pass
 
+# --- تشغيل البوت والخدمات الرئيسية ---
 async def main():
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
