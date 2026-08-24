@@ -13,33 +13,41 @@ from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.types import Channel, Chat
 
 # --- البيانات الأساسية ---
-API_ID = 7226664693
-API_HASH = '4e7a8aee718c1e8e63956fec3339d01d'
-BOT_TOKEN = '8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOhC5qSA4k'
-ADMIN_ID = 7226664693
+API_ID = int(os.environ.get("API_ID", 30327806))
+API_HASH = os.environ.get("API_HASH", "e2fddd21d8966b80eeb0fed4c37a7597")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8620273059:AAE6jHcDIb0S3BxlUJffdrZMRtOhC5qSA4k")
+
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# --- تحميل نموذج NudeNet ONNX خفيف الوزن ---
+# --- تحميل نموذج ONNX ---
 MODEL_PATH = "detector.onnx"
-MODEL_URL = "https://github.com/nottyo/NudeNet/releases/download/v0/detector.onnx"
+MODEL_URL = "https://github.com/nottyo/NudeNet/releases/download/v0.0/detector.onnx"
 
 if not os.path.exists(MODEL_PATH):
-    print("جاري تحميل نموذج فحص الصور الإباحية...")
+    print("جاري تحميل نموذج الفحص...")
     try:
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("تم تحميل النموذج بنجاح!")
     except Exception as e:
-        print(f"خطأ أثناء تحميل النموذج: {e}")
+        print(f"⚠️ تعذر تحميل النموذج تلقائياً: {e}")
 
-session_ort = ort.InferenceSession(MODEL_PATH) if os.path.exists(MODEL_PATH) else None
+session_ort = None
+if os.path.exists(MODEL_PATH):
+    try:
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        session_ort = ort.InferenceSession(MODEL_PATH, opts)
+    except Exception as e:
+        print(f"فشل إعداد نموذج ONNX: {e}")
 
-# --- سيرفر Flask لمنع توقف الخدمة ---
+# --- سيرفر Flask لتجاوز Health Check في Railway ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "Cleaner Bot is Online!"
+    return "Cleaner Bot is Running!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -47,7 +55,7 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# --- الكلمات المكتوبة المخالفة ---
+# --- الكلمات المخالفة ---
 EXPLICIT_KEYWORDS = [
     "سكس", "جنس", "اباحي", "إباحي", "شرموط", "قحبة", "دعارة", "فضايح", "فضيحة",
     "سكسي", "تعري", "نيك", "ممحونة", "ورعان", "طيز", "زب", "كس", "افلام جنس",
@@ -71,21 +79,19 @@ def is_explicit_text(text):
     text_lower = text.lower()
     return any(kw in text_lower for kw in EXPLICIT_KEYWORDS)
 
-# --- دالة فتح وتحليل الصورة عبر الذكاء الاصطناعي ---
 def is_explicit_image(image_path):
     if not session_ort:
         return False
     try:
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize((320, 320))
-        img_data = np.array(img).astype(np.float32) / 255.0
-        img_data = np.transpose(img_data, (2, 0, 1))
-        img_data = np.expand_dims(img_data, axis=0)
+        with Image.open(image_path) as img:
+            img = img.convert('RGB').resize((320, 320))
+            img_data = np.array(img).astype(np.float32) / 255.0
+            img_data = np.transpose(img_data, (2, 0, 1))
+            img_data = np.expand_dims(img_data, axis=0)
 
         input_name = session_ort.get_inputs()[0].name
         outputs = session_ort.run(None, {input_name: img_data})
         
-        # إذا تم كشف أي عناصر إباحية بنسبة ثقة عالية
         if len(outputs) > 0 and len(outputs[0]) > 0:
             for detection in outputs[0]:
                 score = detection[4] if len(detection) > 4 else 0
@@ -95,17 +101,21 @@ def is_explicit_image(image_path):
         print(f"خطأ في فحص الصورة: {e}")
     return False
 
-# --- دالة فحص المجموعات والخروج منها ---
 async def clean_account(session_file, status_msg):
     phone = os.path.basename(session_file).replace('.session', '')
-    with open(session_file, 'r', encoding='utf-8') as f:
-        session_str = f.read().strip()
+    try:
+        with open(session_file, 'r', encoding='utf-8') as f:
+            session_str = f.read().strip()
+    except Exception as e:
+        await status_msg.respond(f"❌ خطأ في قراءة ملف الجلسة `{phone}`: {e}")
+        return 0
 
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
         await client.connect()
         if not await client.is_user_authorized():
             await status_msg.respond(f"❌ الجلسة للحساب `{phone}` منتهية.")
+            await client.disconnect()
             return 0
     except Exception as e:
         await status_msg.respond(f"⚠️ فشل الاتصال بالحساب `{phone}`: {e}")
@@ -124,11 +134,9 @@ async def clean_account(session_file, status_msg):
             title = dialog.name or ""
             is_explicit = False
 
-            # 1. فحص الاسم أولاً
             if is_explicit_text(title):
                 is_explicit = True
 
-            # 2. تنزيل وفتح صورة المحادثة/الجروب وفحصها
             if not is_explicit:
                 try:
                     photo_path = await client.download_profile_photo(entity, file=os.path.join(temp_dir, f"{phone}_prof.jpg"))
@@ -139,7 +147,6 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
-            # 3. فحص آخر 10 رسائل وصور داخل الجروب
             if not is_explicit:
                 try:
                     async for message in client.iter_messages(entity, limit=10):
@@ -163,13 +170,12 @@ async def clean_account(session_file, status_msg):
                 except Exception:
                     pass
 
-            # الخروج من المجموعات الإباحية
             if is_explicit:
                 try:
                     await client(LeaveChannelRequest(entity))
                     left_count += 1
-                    await status_msg.edit(f"⏳ جاري فحص `{phone}`...\n🚨 تم اكتشاف محتوى إباحي والمغادرة من: **{title}**\nإجمالي المغادرات: {left_count}")
-                    await asyncio.sleep(2)
+                    await status_msg.edit(f"⏳ جاري فحص `{phone}`...\n🚨 تم المغادرة من: **{title}**\nإجمالي المغادرات: {left_count}")
+                    await asyncio.sleep(1)
                 except Exception:
                     pass
     finally:
@@ -268,7 +274,7 @@ async def input_handler(event):
         try:
             await client.sign_in(phone, text, phone_code_hash=hash_val)
         except Exception as e:
-            if "TWO_STEP" in str(e):
+            if "TWO_STEP" in str(e) or "Password" in str(e):
                 user_states[chat_id]['step'] = 'await_password'
                 await status_msg.edit("الحساب محمّي بكلمة مرور، أرسل كلمة المرور:")
                 return
