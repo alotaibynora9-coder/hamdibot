@@ -9,7 +9,6 @@ import time
 from threading import Thread
 from flask import Flask
 
-# استيراد المكتبة الرئيسية والأدوات المطلوبة
 import telethon
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
@@ -382,9 +381,7 @@ async def run_full_extraction_and_distribute(user_id):
 
     return total_tg, total_wa
 
-# --- الدالة المجدولة تلقائياً يومياً ---
 async def scheduled_daily_extraction():
-    """دالة الجدولة اليومية للاستخراج التلقائي للروابط"""
     while True:
         try:
             print("[+] بدء دالة الاستخراج المجدولة اليومية...")
@@ -396,29 +393,25 @@ async def scheduled_daily_extraction():
             print(f"[⚠️] خطأ أثناء الاستخراج المجدول: {e}")
             await asyncio.sleep(300)
 
-# --- معالجة شروط الأسماء للفلترة ---
 def process_name_rules(title):
     has_arabic = bool(re.search(r'[\u0600-\u06FF]', title))
     has_english = bool(re.search(r'[a-zA-Z]', title))
     title_lower = title.lower()
 
-    # 1. كلمات إباحية / ضارة -> مغادرة
     for kw in NSFW_KEYWORDS:
         if kw in title_lower:
             return True, f"اسم يحتوي على كلمة مخالفة ({kw})"
 
-    # 2. إنجليزي فقط (بدون أي حرف عربي) -> مغادرة
     if has_english and not has_arabic:
         return True, "الاسم إنجليزي بالكامل"
 
-    # 3. عربي أو مخلوط -> عدم المغادرة
     return False, ""
 
-# --- دالة مستقلة تماماً لفحص ومغادرة الجروبات/القنوات/البوتات ---
+# --- دالة الفحص الشامل لجميع المحادثات بدون حد أقصى ---
 async def process_standalone_scanner_for_account(client, user_id, phone):
-    """دالة سريعة ومستقلة تقرأ محادثات الحساب وتغادر العناصر المخالفة فوراً"""
     try:
-        async for dialog in client.iter_dialogs(limit=100):
+        # إزالة Limit ليتم فحص جميع الجروبات القائمة داخل الحساب
+        async for dialog in client.iter_dialogs(limit=None):
             if not is_nsfw_scanner_enabled(user_id):
                 break
 
@@ -431,19 +424,14 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
                 entity_type_str = "🤖 بوت"
                 is_bot = True
             elif isinstance(entity, Channel):
-                if entity.broadcast:
-                    entity_type_str = "📢 قناة"
-                else:
-                    entity_type_str = "👥 مجموعة"
+                entity_type_str = "📢 قناة" if entity.broadcast else "👥 مجموعة"
             elif isinstance(entity, Chat):
                 entity_type_str = "👥 مجموعة"
             else:
                 continue
 
-            # فحص الاسم واللغة
             should_leave, reason = process_name_rules(title)
 
-            # فحص الجروبات المقفلة
             if not should_leave and is_leave_locked_enabled(user_id) and not is_bot:
                 if hasattr(entity, 'default_banned_rights') and entity.default_banned_rights:
                     if entity.default_banned_rights.send_messages:
@@ -458,36 +446,29 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
                     else:
                         await client(LeaveChannelRequest(entity))
 
-                    # تقرير فوري للبوت
                     await bot.send_message(
                         user_id,
-                        f"🛡️ **[تقرير الفحص السريع]**\n\n"
+                        f"🛡️ **[تم اكتشاف ومغادرة عنصر مخالف]**\n\n"
                         f"📱 **الحساب:** `{phone}`\n"
                         f"📌 **الاسم:** {title}\n"
                         f"🏷️ **النوع:** {entity_type_str}\n"
                         f"📝 **السبب:** {reason}\n"
-                        f"🚪 **الإجراء:** تم المغادرة/الحظر بنجاح."
+                        f"🚪 **الإجراء:** تم المغادرة بنجاح."
                     )
                 except Exception as ex_leave:
                     print(f"[⚠️] فشل المغادرة من {title}: {ex_leave}")
 
-            # فاصل زمني سريع جداً بين القنوات لعدم إجهاد السيرفر
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.02)
 
     except FloodWaitError as e:
-        print(f"[⏳] الحساب {phone} في حالة انتظار FloodWait لمدة {e.seconds} ثانية. الانتقال للحساب التالي...")
+        print(f"[⏳] الحساب {phone} في حالة انتظار FloodWait لمدة {e.seconds} ثانية.")
     except Exception as e:
         print(f"[⚠️] خطأ غير متوقع أثناء فحص الحساب {phone}: {e}")
 
-# --- حلقة الفحص والتنقل الدوري المستمر والسريع ---
+# --- حلقة الفحص والتنقل الدوري المعدلة للتشغيل المباشر ---
 async def run_nsfw_scanner_loop(user_id):
-    """حلقة مستقلة تماماً وتعمل بصفة دورية ودون توقف للتنقل السريع بين الحسابات"""
-    while True:
+    while is_nsfw_scanner_enabled(user_id):
         try:
-            if not is_nsfw_scanner_enabled(user_id):
-                await asyncio.sleep(3)
-                continue
-
             accounts = await get_active_accounts(user_id)
             user_folder = get_user_folder(user_id)
 
@@ -507,26 +488,23 @@ async def run_nsfw_scanner_loop(user_id):
                 try:
                     await client.connect()
                     if await client.is_user_authorized():
-                        # تشغيل الفحص السريع للحساب
                         await process_standalone_scanner_for_account(client, user_id, phone)
                     await client.disconnect()
                 except Exception as e:
-                    print(f"[⚠️] تجاوز الحساب {phone} والانتقال للتالي بسبب خطأ: {e}")
+                    print(f"[⚠️] تجاوز الحساب {phone} بسبب خطأ: {e}")
                     try:
                         await client.disconnect()
                     except Exception:
                         pass
 
-                # الانتقال المباشر والفوري للحساب التالي
                 await asyncio.sleep(0.1)
 
-            # انتهاء دورة الحسابات والبدء من جديد فوراً
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"[⚠️] خطأ عام في حلقة الفحص المستقلة: {e}")
+            print(f"[⚠️] خطأ عام في حلقة الفحص: {e}")
             await asyncio.sleep(3)
 
 @bot.on(events.CallbackQuery)
@@ -568,9 +546,10 @@ async def callback_handler(event):
         set_nsfw_scanner_setting(user_id, new_status)
         
         if new_status:
-            if not nsfw_scanner_tasks.get(user_id) or nsfw_scanner_tasks[user_id].done():
-                nsfw_scanner_tasks[user_id] = asyncio.create_task(run_nsfw_scanner_loop(user_id))
-            await event.answer("تم تفعيل الفحص التلقائي المستقل والسريع ✅", alert=True)
+            if user_id in nsfw_scanner_tasks and not nsfw_scanner_tasks[user_id].done():
+                nsfw_scanner_tasks[user_id].cancel()
+            nsfw_scanner_tasks[user_id] = asyncio.create_task(run_nsfw_scanner_loop(user_id))
+            await event.answer("تم تفعيل الفحص المباشر والسريع بنجاح ✅", alert=True)
         else:
             if user_id in nsfw_scanner_tasks:
                 nsfw_scanner_tasks[user_id].cancel()
@@ -1096,7 +1075,6 @@ async def message_handler(event):
         user_states[user_id] = None
         await event.respond(f'✅ تم إضافة **{len(filtered_links)}** رابط جديد بنجاح.', buttons=main_keyboard(user_id))
 
-# --- منطق الانضمام للروابط المطور ---
 async def join_links_logic(
     user_id,
     client,
@@ -1178,11 +1156,9 @@ async def join_links_logic(
                 extracted_links.remove(link)
                 save_to_file(links_file, extracted_links)
 
-        # انتظار الفاصل المعتمد
         delay = get_user_delay(user_id)
         await asyncio.sleep(delay)
 
-# --- حلقة الانضمام التلقائي اللانهائية ---
 async def run_infinite_loop(user_id, status_msg):
     user_folder = get_user_folder(user_id)
     global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
@@ -1246,26 +1222,20 @@ async def run_infinite_loop(user_id, status_msg):
     except Exception:
         pass
 
-# --- تشغيل البوت والخدمات الرئيسية ---
 async def main():
-    # 1. تشغيل سيرفر Flask في thread مستقل
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # 2. تشغيل البوت وتعيين القائمة
     await bot.start(bot_token=BOT_TOKEN)
     await set_bot_commands()
     print("[+] تم تشغيل البوت بنجاح...")
 
-    # 3. تشغيل دالة الاستخراج المجدولة اليومية في الخلفية
     asyncio.create_task(scheduled_daily_extraction())
 
-    # 4. تشغيل فحص الجروبات/القنوات/البوتات للمستخدمين المفعّلين بحلقة مستقلة
     for u_id in load_allowed_users():
         if is_nsfw_scanner_enabled(u_id):
             nsfw_scanner_tasks[u_id] = asyncio.create_task(run_nsfw_scanner_loop(u_id))
 
-    # الإبقاء على البوت يعمل باستمرار
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
