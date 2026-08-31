@@ -183,6 +183,14 @@ async def get_active_accounts(user_id):
     saved_sessions = glob.glob(f'{user_folder}/*.session')
     return [os.path.basename(p).replace('.session', '') for p in saved_sessions]
 
+# --- دالة التحقق الإجباري من الاتصال وتجديده عند الانقطاع ---
+async def ensure_connected(client):
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as e:
+            print(f"[⚠️] فشلت إعادة الاتصال: {e}")
+
 def main_keyboard(user_id):
     leave_status = "🟢 مفعل" if is_leave_locked_enabled(user_id) else "🔴 معطل"
     nsfw_status = "🟢 مفعل" if is_nsfw_scanner_enabled(user_id) else "🔴 معطل"
@@ -277,7 +285,7 @@ async def start_handler(event):
     user_states[user_id] = None
     await event.respond(
         '⭐ **مرحباً بك في مدير الانضمام والاستخراج التلقائي المطور**\n\n'
-        'تم تحديث شروط الفحص لتنظيف الحسابات ومغادرة أي مجموعات/قنوات غير عربية أو تحتوي على رموز ولغات أجنبية.',
+        'تم إحكام الربط ومنع مشكلة الانقطاع أثناء الانضمام للروابط.',
         buttons=main_keyboard(user_id),
     )
 
@@ -405,20 +413,18 @@ def process_name_rules(title):
         if kw in title_lower:
             return True, f"كلمة مخالفة ({kw})"
 
-    # 2. فحص وجود الحروف العربية (النطاق \u0600-\u06FF)
+    # 2. فحص وجود الحروف العربية
     has_arabic = bool(re.search(r'[\u0600-\u06FF]', title_strip))
 
-    # إذا كان الاسم لا يحتوي على لغة عربية اطلاقاً (إنجليزية، رموز، لغات أخرى، أو إيموجي فقط) -> مغادرة
     if not has_arabic:
         return True, "الاسم لغة غير عربية / رموز / إنجليزي"
 
-    # الاسم محتفظ به لأنه يحتوي لغة عربية
     return False, ""
 
 # --- دالة الفحص المستقلة المعدلة والشاملة لجميع الجروبات ---
 async def process_standalone_scanner_for_account(client, user_id, phone):
     try:
-        # limit=None يضمن المرور على كافة المحادثات والجروبات بالكامل دون تجاوز أي منها
+        await ensure_connected(client)
         async for dialog in client.iter_dialogs(limit=None):
             if not is_nsfw_scanner_enabled(user_id):
                 break
@@ -438,10 +444,8 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
             else:
                 continue
 
-            # تطبيق شروط الفحص الجديدة
             should_leave, reason = process_name_rules(title)
 
-            # فحص الجروبات المقفلة
             if not should_leave and is_leave_locked_enabled(user_id) and not is_bot:
                 if hasattr(entity, 'default_banned_rights') and entity.default_banned_rights:
                     if entity.default_banned_rights.send_messages:
@@ -450,13 +454,13 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
 
             if should_leave:
                 try:
+                    await ensure_connected(client)
                     if is_bot:
                         await client(BlockRequest(entity.id))
                         await client(DeleteHistoryRequest(peer=entity, max_id=0, revoke=True))
                     else:
                         await client(LeaveChannelRequest(entity))
 
-                    # إرسال تقرير فوري للمستخدم
                     await bot.send_message(
                         user_id,
                         f"🛡️ **[تقرير الفحص المطور]**\n\n"
@@ -517,6 +521,180 @@ async def run_nsfw_scanner_loop(user_id):
         except Exception as e:
             print(f"[⚠️] خطأ في حلقة الفحص: {e}")
             await asyncio.sleep(3)
+
+# --- منطق الانضمام للحساب الواحد وتجنب انقطاع الاتصال ---
+async def join_links_logic(
+    user_id,
+    client,
+    phone,
+    extracted_links,
+    links_file,
+    global_joined_path,
+    acc_joined_file,
+    user_folder,
+    status_msg,
+):
+    shared_private_path = os.path.join(user_folder, SHARED_PRIVATE_FILE)
+
+    for link in list(extracted_links):
+        if stop_signals.get(user_id, False):
+            break
+
+        global_joined = load_list_from_file(global_joined_path)
+        if link in global_joined:
+            extracted_links.remove(link)
+            save_to_file(links_file, extracted_links)
+            continue
+
+        action_str = f"📱 الحساب الحالي: `{phone}`\n🔗 الرابط: `{link}`"
+        current_action_status[user_id] = action_str
+        try:
+            await status_msg.edit(f"⚙️ **جاري العمل الحالي:**\n{action_str}")
+        except Exception:
+            pass
+
+        # التحقق من أن اتصال التليجرام قائم بالفعل قبل إرسال الطلب
+        await ensure_connected(client)
+
+        try:
+            if 'joinchat/' in link or '+' in link:
+                hash_val = link.split('/')[-1].replace('+', '')
+                try:
+                    check_res = await client(CheckChatInviteRequest(hash_val))
+                    chat_title = getattr(check_res.chat, 'title', 'مجموعة خاصة')
+                    
+                    if hasattr(check_res, 'already_joined') and check_res.already_joined:
+                        append_to_file(shared_private_path, [link])
+                        await bot.send_message(user_id, f'🔒 [{phone}]: انضمام سابق لمجموعة خاصة ({chat_title}).\n🔗 {link}')
+                    else:
+                        await client(ImportChatInviteRequest(hash_val))
+                        append_to_file(shared_private_path, [link])
+                        await bot.send_message(user_id, f'🎉 [{phone}]: انضمام ناجح لمجموعة خاصة ({chat_title})! 🔒\n🔗 {link}')
+
+                except Exception as ex_inv:
+                    ex_str = str(ex_inv)
+                    if "USER_ALREADY_PARTICIPANT" in ex_str or "already a participant" in ex_str:
+                        append_to_file(shared_private_path, [link])
+                        await bot.send_message(user_id, f'ℹ️ [{phone}]: الحساب منضم مسبقاً لهذا الرابط الخاص.\n🔗 {link}')
+                    elif "requested to join" in ex_str or "INVITE_REQUEST_SENT" in ex_str:
+                        append_to_file(shared_private_path, [link])
+                        await bot.send_message(user_id, f'📩 [{phone}]: تم إرسال طلب الانضمام وبانتظار موافقة المشرف.\n🔗 {link}')
+                    else:
+                        raise ex_inv
+            else:
+                target = link.split('/')[-1]
+                ent = await client.get_entity(target)
+                await client(JoinChannelRequest(ent))
+                await bot.send_message(user_id, f'🎉 [{phone}]: تم الانضمام بنجاح للرابط العام:\n🔗 {link}')
+
+            # حفظ الانضمام الناجح وتحديث الملفات
+            append_to_file(global_joined_path, [link])
+            append_to_file(acc_joined_file, [link])
+            extracted_links.remove(link)
+            save_to_file(links_file, extracted_links)
+
+        except FloodWaitError as e:
+            user_floods = flood_expiry.setdefault(user_id, {})
+            user_floods[phone] = time.time() + e.seconds
+            await bot.send_message(user_id, f'⏳ [{phone}]: تعذر الانضمام للرابط بسبب تقييد مؤقت (FloodWait) لمدة {e.seconds} ثانية.')
+            break
+
+        except Exception as e:
+            ex_err = str(e)
+            if "Disconnected" in ex_err or "disconnected" in ex_err:
+                print(f"[⚠️] حدث انقطاع أثناء طلب الانضمام، جاري إعادة المحاولة... ({ex_err})")
+                await asyncio.sleep(2)
+                await ensure_connected(client)
+                continue
+
+            save_failed_link(user_folder, phone, link, ex_err)
+            await bot.send_message(user_id, f'❌ [{phone}]: فشل الانضمام للرابط:\n{link}\n┗ السبب: `{ex_err}`')
+            
+            # إزالة الرابط الفاشل لتجنب التكرار النهائي
+            extracted_links.remove(link)
+            save_to_file(links_file, extracted_links)
+
+        # انتظار الفاصل المحدد بين كل انضمام
+        delay_sec = get_user_delay(user_id)
+        await asyncio.sleep(delay_sec)
+
+# --- الحلقة الرئيسية اللانهائية لتشغيل المحرك ---
+async def run_infinite_loop(user_id, status_msg):
+    user_folder = get_user_folder(user_id)
+    global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
+
+    while not stop_signals.get(user_id, False):
+        try:
+            accounts = await get_active_accounts(user_id)
+            if not accounts:
+                current_action_status[user_id] = "لا توجد حسابات نشطة مضافة."
+                await status_msg.edit("⚠️ لا توجد حسابات مضافة حالياً لعمل المحرك.")
+                await asyncio.sleep(10)
+                continue
+
+            worked_any = False
+
+            for phone in accounts:
+                if stop_signals.get(user_id, False):
+                    break
+
+                # تخطي الحسابات المحظورة مؤقتاً
+                user_floods = flood_expiry.get(user_id, {})
+                if user_floods.get(phone, 0) > time.time():
+                    continue
+
+                links_file = os.path.join(user_folder, f'custom_{phone}_links.txt')
+                extracted_links = load_list_from_file(links_file)
+
+                if not extracted_links:
+                    continue
+
+                worked_any = True
+                acc_joined_file = os.path.join(user_folder, f'joined_{phone}_links.txt')
+                session_file = os.path.join(user_folder, f'{phone}.session')
+
+                client = TelegramClient(session_file, API_ID, API_HASH)
+                try:
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        await join_links_logic(
+                            user_id,
+                            client,
+                            phone,
+                            extracted_links,
+                            links_file,
+                            global_joined_path,
+                            acc_joined_file,
+                            user_folder,
+                            status_msg,
+                        )
+                    await client.disconnect()
+                except Exception as e:
+                    print(f"[⚠️] خطأ بفتح جلسة الحساب {phone}: {e}")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+            if not worked_any:
+                current_action_status[user_id] = "جميع الحسابات مكتملة أو في حالة انتظار (FloodWait)."
+                try:
+                    await status_msg.edit("😴 لا توجد روابط متبقية للانضمام في جميع الحسابات حالياً. بانتظار روابط جديدة...")
+                except Exception:
+                    pass
+                await asyncio.sleep(15)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[⚠️] خطأ بالحلقة الرئيسية: {e}")
+            await asyncio.sleep(5)
+
+    current_action_status[user_id] = "المحرك متوقف."
+    try:
+        await status_msg.edit("⏹ **تم إيقاف محرك الانضمام التلقائي بنجاح.**")
+    except Exception:
+        pass
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -1085,190 +1263,13 @@ async def message_handler(event):
         user_states[user_id] = None
         await event.respond(f'✅ تم إضافة **{len(filtered_links)}** رابط جديد بنجاح.', buttons=main_keyboard(user_id))
 
-# --- منطق الانضمام للروابط المطور ---
-# --- منطق الانضمام للحساب الواحد حتى الوصول للحظر المؤقت أو انتهاء الروابط ---
-async def join_links_logic(
-    user_id,
-    client,
-    phone,
-    extracted_links,
-    links_file,
-    global_joined_path,
-    acc_joined_file,
-    user_folder,
-    status_msg,
-):
-    shared_private_path = os.path.join(user_folder, SHARED_PRIVATE_FILE)
-
-    for link in list(extracted_links):
-        if stop_signals.get(user_id, False):
-            break
-
-        global_joined = load_list_from_file(global_joined_path)
-        if link in global_joined:
-            extracted_links.remove(link)
-            save_to_file(links_file, extracted_links)
-            continue
-
-        action_str = f"📱 الحساب الحالي: `{phone}`\n🔗 الرابط: `{link}`"
-        current_action_status[user_id] = action_str
-        try:
-            await status_msg.edit(f"⚙️ **جاري العمل الحالي:**\n{action_str}")
-        except Exception:
-            pass
-
-        hit_flood_wait = False
-
-        try:
-            if 'joinchat/' in link or '+' in link:
-                hash_val = link.split('/')[-1].replace('+', '')
-                try:
-                    check_res = await client(CheckChatInviteRequest(hash_val))
-                    chat_title = getattr(check_res.chat, 'title', 'مجموعة خاصة')
-                    
-                    if hasattr(check_res, 'already_joined') and check_res.already_joined:
-                        append_to_file(shared_private_path, [link])
-                        await bot.send_message(user_id, f'🔒 [{phone}]: انضمام سابق لمجموعة خاصة ({chat_title}).\n🔗 {link}')
-                    else:
-                        await client(ImportChatInviteRequest(hash_val))
-                        append_to_file(shared_private_path, [link])
-                        await bot.send_message(user_id, f'🎉 [{phone}]: انضمام ناجح لمجموعة خاصة ({chat_title})! 🔒\n🔗 {link}')
-
-                except Exception as ex_inv:
-                    ex_str = str(ex_inv)
-                    # معالجة الانضمام المسبق وطلب الانضمام المكتمل
-                    if "USER_ALREADY_PARTICIPANT" in ex_str or "already a participant" in ex_str:
-                        append_to_file(shared_private_path, [link])
-                        await bot.send_message(user_id, f'ℹ️ [{phone}]: الحساب منضم مسبقاً لهذا الرابط الخاص.\n🔗 {link}')
-                    elif "requested to join" in ex_str or "INVITE_REQUEST_SENT" in ex_str:
-                        append_to_file(shared_private_path, [link])
-                        await bot.send_message(user_id, f'📩 [{phone}]: تم إرسال طلب الانضمام وبانتظار موافقة المشرف.\n🔗 {link}')
-                    else:
-                        raise ex_inv
-            else:
-                target = link.split('/')[-1]
-                try:
-                    ent = await client.get_entity(target)
-                    await client(JoinChannelRequest(ent))
-                    await bot.send_message(user_id, f'🎉 [{phone}]: انضمام ناجح لـ `{target}`!\n🔗 {link}')
-                except Exception as ex_pub:
-                    ex_str = str(ex_pub)
-                    # معالجة طلبات الانضمام وحالة الانضمام المسبق
-                    if "USER_ALREADY_PARTICIPANT" in ex_str or "already a participant" in ex_str:
-                        await bot.send_message(user_id, f'ℹ️ [{phone}]: الحساب منضم مسبقاً لـ `{target}`.\n🔗 {link}')
-                    elif "requested to join" in ex_str or "INVITE_REQUEST_SENT" in ex_str:
-                        await bot.send_message(user_id, f'📩 [{phone}]: تم إرسال طلب الانضمام لـ `{target}` وبانتظار الموافقة.\n🔗 {link}')
-                    else:
-                        raise ex_pub
-
-            append_to_file(global_joined_path, [link])
-            append_to_file(acc_joined_file, [link])
-
-        except FloodWaitError as e:
-            wait_time = e.seconds
-            flood_expiry.setdefault(user_id, {})[phone] = time.time() + wait_time
-            save_failed_link(user_folder, phone, link, f"حظر مؤقت لمدة {wait_time} ثانية (FloodWait)")
-            await bot.send_message(user_id, f'⏳ [{phone}]: دخل حالة الانتظار/الحظر المؤقت لمدة {wait_time} ثانية.\n➡️ **جاري الانتقال فوراً للحساب التالي...**')
-            hit_flood_wait = True
-
-        except Exception as e:
-            save_failed_link(user_folder, phone, link, str(e))
-            await bot.send_message(user_id, f'❌ [{phone}]: فشل الانضمام للرابط: {link}\n┗ **السبب:** {e}')
-
-        finally:
-            if link in extracted_links:
-                extracted_links.remove(link)
-                save_to_file(links_file, extracted_links)
-
-        # الخروج فوراً للانتقال للحساب التالي عند التعرض لـ FloodWait
-        if hit_flood_wait:
-            break
-
-        delay = get_user_delay(user_id)
-        await asyncio.sleep(delay)
-
-# --- حلقة التحكم والتنقل المتسلسل بين الحسابات ---
-async def run_infinite_loop(user_id, status_msg):
-    user_folder = get_user_folder(user_id)
-    global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
-
-    while not stop_signals.get(user_id, False):
-        accounts = await get_active_accounts(user_id)
-        if not accounts:
-            current_action_status[user_id] = "لا توجد حسابات مضافة."
-            await asyncio.sleep(10)
-            continue
-
-        any_link_processed = False
-
-        for phone in accounts:
-            if stop_signals.get(user_id, False):
-                break
-
-            # تخطي الحساب إذا كان محظوراً مؤقتاً
-            user_floods = flood_expiry.get(user_id, {})
-            if user_floods.get(phone, 0) > time.time():
-                continue
-
-            session_file = os.path.join(user_folder, f'{phone}.session')
-            links_file = os.path.join(user_folder, f'custom_{phone}_links.txt')
-            acc_joined_file = os.path.join(user_folder, f'joined_{phone}_links.txt')
-
-            extracted_links = load_list_from_file(links_file)
-            if not extracted_links:
-                continue
-
-            client = TelegramClient(session_file, API_ID, API_HASH)
-            try:
-                await client.connect()
-                if not await client.is_user_authorized():
-                    await client.disconnect()
-                    continue
-
-                any_link_processed = True
-                
-                # ينفذ العمليات داخل نفس الحساب حتى انتهاء روابطه أو حصول FloodWait
-                await join_links_logic(
-                    user_id,
-                    client,
-                    phone,
-                    extracted_links,
-                    links_file,
-                    global_joined_path,
-                    acc_joined_file,
-                    user_folder,
-                    status_msg,
-                )
-                await client.disconnect()
-
-            except Exception as e:
-                print(f"[⚠️] خطأ بالحساب {phone}: {e}")
-
-        if not any_link_processed:
-            current_action_status[user_id] = "جميع الحسابات في حالة انتظار أو لا توجد روابط جديدة..."
-            await asyncio.sleep(15)
-
-    current_action_status[user_id] = "🔴 المدير متوقف حالياً."
-    try:
-        await status_msg.edit("⏹ **تم إيقاف محرك الانضمام بنجاح.**")
-    except Exception:
-        pass
-
-# --- تشغيل البوت والخدمات الرئيسية ---
+# --- تشغيل البوت مع السيرفر والمهام الخلفية ---
 async def main():
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
+    Thread(target=run_flask, daemon=True).start()
+    asyncio.create_task(scheduled_daily_extraction())
     await bot.start(bot_token=BOT_TOKEN)
     await set_bot_commands()
-    print("[+] تم تشغيل البوت بنجاح...")
-
-    asyncio.create_task(scheduled_daily_extraction())
-
-    for u_id in load_allowed_users():
-        if is_nsfw_scanner_enabled(u_id):
-            nsfw_scanner_tasks[u_id] = asyncio.create_task(run_nsfw_scanner_loop(u_id))
-
+    print("[+] البوت يعمل الآن وتأكد من استقرار الاتصال...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
