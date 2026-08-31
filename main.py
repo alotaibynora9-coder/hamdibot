@@ -285,7 +285,7 @@ async def start_handler(event):
     user_states[user_id] = None
     await event.respond(
         '⭐ **مرحباً بك في مدير الانضمام والاستخراج التلقائي المطور**\n\n'
-        'تم إحكام الربط ومنع مشكلة الانقطاع أثناء الانضمام للروابط.',
+        'تم إحكام الربط ومنع مشكلة الانقطاع ومعالجة أسماء الجروبات الخاصة بنجاح.',
         buttons=main_keyboard(user_id),
     )
 
@@ -390,7 +390,6 @@ async def run_full_extraction_and_distribute(user_id):
 
     return total_tg, total_wa
 
-# --- الدالة المجدولة تلقائياً يومياً ---
 async def scheduled_daily_extraction():
     while True:
         try:
@@ -403,25 +402,20 @@ async def scheduled_daily_extraction():
             print(f"[⚠️] خطأ أثناء الاستخراج المجدول: {e}")
             await asyncio.sleep(300)
 
-# --- معالجة شروط الأسماء المعدلة (الاحتفاظ فقط باللغة العربية) ---
 def process_name_rules(title):
     title_strip = title.strip() if title else ""
     title_lower = title_strip.lower()
 
-    # 1. فحص الكلمات الإباحية
     for kw in NSFW_KEYWORDS:
         if kw in title_lower:
             return True, f"كلمة مخالفة ({kw})"
 
-    # 2. فحص وجود الحروف العربية
     has_arabic = bool(re.search(r'[\u0600-\u06FF]', title_strip))
-
     if not has_arabic:
         return True, "الاسم لغة غير عربية / رموز / إنجليزي"
 
     return False, ""
 
-# --- دالة الفحص المستقلة المعدلة والشاملة لجميع الجروبات ---
 async def process_standalone_scanner_for_account(client, user_id, phone):
     try:
         await ensure_connected(client)
@@ -480,7 +474,6 @@ async def process_standalone_scanner_for_account(client, user_id, phone):
     except Exception as e:
         print(f"[⚠️] خطأ أثناء فحص الحساب {phone}: {e}")
 
-# --- حلقة التنقل السريع بين الحسابات للفحص ---
 async def run_nsfw_scanner_loop(user_id):
     while is_nsfw_scanner_enabled(user_id):
         try:
@@ -522,7 +515,7 @@ async def run_nsfw_scanner_loop(user_id):
             print(f"[⚠️] خطأ في حلقة الفحص: {e}")
             await asyncio.sleep(3)
 
-# --- منطق الانضمام للحساب الواحد وتجنب انقطاع الاتصال ---
+# --- منطق الانضمام المعدل لمنع خطأ ChatInvite ---
 async def join_links_logic(
     user_id,
     client,
@@ -553,7 +546,6 @@ async def join_links_logic(
         except Exception:
             pass
 
-        # التحقق من أن اتصال التليجرام قائم بالفعل قبل إرسال الطلب
         await ensure_connected(client)
 
         try:
@@ -561,7 +553,12 @@ async def join_links_logic(
                 hash_val = link.split('/')[-1].replace('+', '')
                 try:
                     check_res = await client(CheckChatInviteRequest(hash_val))
-                    chat_title = getattr(check_res.chat, 'title', 'مجموعة خاصة')
+                    
+                    # الفحص الآمن لخاصية اسم المجموعة لمنع الخطأ
+                    if hasattr(check_res, 'chat'):
+                        chat_title = getattr(check_res.chat, 'title', 'مجموعة خاصة')
+                    else:
+                        chat_title = getattr(check_res, 'title', 'مجموعة خاصة')
                     
                     if hasattr(check_res, 'already_joined') and check_res.already_joined:
                         append_to_file(shared_private_path, [link])
@@ -569,7 +566,7 @@ async def join_links_logic(
                     else:
                         await client(ImportChatInviteRequest(hash_val))
                         append_to_file(shared_private_path, [link])
-                        await bot.send_message(user_id, f'🎉 [{phone}]: انضمام ناجح لمجموعة خاصة ({chat_title})! 🔒\n🔗 {link}')
+                        await bot.send_message(user_id, f'🎉 [{phone}]: تم الانضمام بنجاح لمجموعة خاصة ({chat_title})! 🔒\n🔗 {link}')
 
                 except Exception as ex_inv:
                     ex_str = str(ex_inv)
@@ -587,7 +584,6 @@ async def join_links_logic(
                 await client(JoinChannelRequest(ent))
                 await bot.send_message(user_id, f'🎉 [{phone}]: تم الانضمام بنجاح للرابط العام:\n🔗 {link}')
 
-            # حفظ الانضمام الناجح وتحديث الملفات
             append_to_file(global_joined_path, [link])
             append_to_file(acc_joined_file, [link])
             extracted_links.remove(link)
@@ -610,15 +606,12 @@ async def join_links_logic(
             save_failed_link(user_folder, phone, link, ex_err)
             await bot.send_message(user_id, f'❌ [{phone}]: فشل الانضمام للرابط:\n{link}\n┗ السبب: `{ex_err}`')
             
-            # إزالة الرابط الفاشل لتجنب التكرار النهائي
             extracted_links.remove(link)
             save_to_file(links_file, extracted_links)
 
-        # انتظار الفاصل المحدد بين كل انضمام
         delay_sec = get_user_delay(user_id)
         await asyncio.sleep(delay_sec)
 
-# --- الحلقة الرئيسية اللانهائية لتشغيل المحرك ---
 async def run_infinite_loop(user_id, status_msg):
     user_folder = get_user_folder(user_id)
     global_joined_path = os.path.join(user_folder, GLOBAL_JOINED_FILE)
@@ -638,7 +631,6 @@ async def run_infinite_loop(user_id, status_msg):
                 if stop_signals.get(user_id, False):
                     break
 
-                # تخطي الحسابات المحظورة مؤقتاً
                 user_floods = flood_expiry.get(user_id, {})
                 if user_floods.get(phone, 0) > time.time():
                     continue
